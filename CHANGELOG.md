@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.0...v0.1.1) (2026-08-27)
+
+
+### Features
+
+* publish Skill Registry through npm ([436a0b0](https://github.com/andresnator/opencode-skill-registry/commit/436a0b0c97639da96a3a9b199bbdc1d027043a2d))
+
 ## 0.1.0 - 2026-08-04
 
 - Extract the skill registry from `agents-orchestrator` into a standalone OpenCode plugin.
