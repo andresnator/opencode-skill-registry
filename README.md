@@ -1,5 +1,7 @@
 # OpenCode Skill Registry
 
+[![npm version](https://img.shields.io/npm/v/opencode-skill-registry.svg)](https://www.npmjs.com/package/opencode-skill-registry)
+
 Generate a lightweight index of skills and convention files available to an OpenCode project. The plugin refreshes the index in the background and writes only when content changes.
 
 ## Install
