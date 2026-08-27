@@ -231,9 +231,9 @@ ${conventions.hashInput}`).digest("hex");
   await ensureInfoExclude(worktree);
 }
 function projectRoot(input) {
-  const worktree = input.worktree ?? "";
-  if (!worktree || worktree === path.parse(worktree).root) return input.directory;
-  return worktree;
+  const reportedWorktree = input.worktree ?? "";
+  if (!reportedWorktree || reportedWorktree === path.parse(reportedWorktree).root) return input.directory;
+  return reportedWorktree;
 }
 var skillRegistryContracts = {
   scalar,

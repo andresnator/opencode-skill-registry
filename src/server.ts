@@ -307,10 +307,10 @@ async function generateRegistry(worktree: string) {
 }
 
 function projectRoot(input: { worktree?: string; directory: string }) {
-  const worktree = input.worktree ?? ""
+  const reportedWorktree = input.worktree ?? ""
   // Non-git projects report the filesystem root as worktree; fall back to the session directory.
-  if (!worktree || worktree === path.parse(worktree).root) return input.directory
-  return worktree
+  if (!reportedWorktree || reportedWorktree === path.parse(reportedWorktree).root) return input.directory
+  return reportedWorktree
 }
 
 // Deterministic test seam consumed by scripts/skill-registry-contracts.ts; not part of the runtime contract.
