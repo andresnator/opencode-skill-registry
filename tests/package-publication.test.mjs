@@ -14,7 +14,7 @@ const NPM_LIFECYCLE_SCRIPTS = [
 const EXPECTED_PACKAGE_FILES = ["LICENSE", "NOTICE.md", "README.md", "dist/server.d.ts", "dist/server.js", "package.json"]
 const packageJson = JSON.parse(await readFile(new URL("package.json", ROOT), "utf8"))
 
-function shouldExposeOnlyTheServerPluginWhenPackageIsPublished() {
+function shouldExposeBothServerEntrypointsWhenPackageIsPublished() {
   const lifecycleScripts = NPM_LIFECYCLE_SCRIPTS.filter((script) => packageJson.scripts?.[script] !== undefined)
   assert.deepEqual(
     {
@@ -37,7 +37,10 @@ function shouldExposeOnlyTheServerPluginWhenPackageIsPublished() {
       main: "./dist/server.js",
       private: undefined,
       publishConfig: { access: "public", registry: NPM_REGISTRY },
-      exports: { "./server": { types: "./dist/server.d.ts", import: "./dist/server.js" } },
+      exports: {
+        ".": { types: "./dist/server.d.ts", import: "./dist/server.js" },
+        "./server": { types: "./dist/server.d.ts", import: "./dist/server.js" },
+      },
       nodeEngine: NODE_RANGE,
       opencodeEngine: OPENCODE_RANGE,
       dependencies: undefined,
@@ -70,6 +73,6 @@ function shouldContainOnlyExpectedFilesWhenPackageIsPacked() {
   )
 }
 
-shouldExposeOnlyTheServerPluginWhenPackageIsPublished()
+shouldExposeBothServerEntrypointsWhenPackageIsPublished()
 shouldContainOnlyExpectedFilesWhenPackageIsPacked()
 process.stdout.write("PASS: 2 npm publication contracts.\n")
