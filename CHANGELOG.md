@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.2...v0.1.3) (2026-08-27)
+
+
+### Bug Fixes
+
+* **install:** support first clean-cache installation ([#9](https://github.com/andresnator/opencode-skill-registry/issues/9)) ([c75c5c2](https://github.com/andresnator/opencode-skill-registry/commit/c75c5c2182a6d008b12be796f0bdff3052d2aec2))
+
 ## [0.1.2](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.1...v0.1.2) (2026-08-27)
 
 
