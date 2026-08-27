@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.1...v0.1.2) (2026-08-27)
+
+
+### Features
+
+* add npm version badge ([#5](https://github.com/andresnator/opencode-skill-registry/issues/5)) ([79fac40](https://github.com/andresnator/opencode-skill-registry/commit/79fac40b2aa486ba5b8e8cf4c02d4070933ff89a))
+
 ## [0.1.1](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.0...v0.1.1) (2026-08-27)
 
 
