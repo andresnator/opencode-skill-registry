@@ -11,6 +11,7 @@ const bundle = await readFile(bundleUrl, "utf8")
 assert.equal(packageJson.name, "opencode-skill-registry")
 assert.equal(packageJson.dependencies, undefined, "published package must not have runtime dependencies")
 assert.equal(packageJson.exports?.["./server"]?.import, "./dist/server.js")
+assert.equal(packageJson.engines?.node, ">=22.0.0")
 assert.equal(packageJson.engines?.opencode, ">=1.17.15 <2")
 assert.ok(!bundle.includes("agents-orchestrator"), "bundle still contains source-harness coupling")
 
