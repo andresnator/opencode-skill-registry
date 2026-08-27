@@ -11,6 +11,7 @@ const bundle = await readFile(bundleUrl, "utf8")
 assert.equal(packageJson.name, "opencode-skill-registry")
 assert.equal(packageJson.dependencies, undefined, "published package must not have runtime dependencies")
 assert.equal(packageJson.exports?.["./server"]?.import, "./dist/server.js")
+assert.equal(packageJson.engines?.node, ">=22.0.0")
 assert.equal(packageJson.engines?.opencode, ">=1.17.15 <2")
 assert.ok(!bundle.includes("agents-orchestrator"), "bundle still contains source-harness coupling")
 
@@ -26,12 +27,12 @@ assert.equal(plugin.default?.id, "andresnator.skill-registry")
 assert.equal(typeof plugin.default?.server, "function")
 assert.equal("tui" in plugin.default, false, "server entry must not also export a TUI plugin")
 
-const packed = spawnSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], {
+const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {
   cwd: root,
   encoding: "utf8",
 })
 assert.equal(packed.status, 0, packed.stderr || packed.stdout)
-const report = JSON.parse(packed.stdout)[0]
+const report = JSON.parse(packed.stdout)
 const files = new Set(report.files.map((entry) => entry.path))
 for (const required of ["dist/server.js", "dist/server.d.ts", "README.md", "LICENSE", "NOTICE.md"]) {
   assert.ok(files.has(required), `package is missing ${required}`)
