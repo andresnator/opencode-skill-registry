@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises"
 const workflow = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8")
 
 function shouldTestCleanCacheInstallationAcrossSupportedOpenCodeVersions() {
-  for (const version of ["1.18.0", "1.18.20", '"1"']) {
+  for (const version of ["1.17.15", "1.18.20", '"1"']) {
     assert.ok(workflow.includes(`version: ${version}`), `CI is missing OpenCode ${version}`)
   }
   for (const contract of [
@@ -15,4 +15,4 @@ function shouldTestCleanCacheInstallationAcrossSupportedOpenCodeVersions() {
 }
 
 shouldTestCleanCacheInstallationAcrossSupportedOpenCodeVersions()
-process.stdout.write("PASS: clean-cache installation CI covers OpenCode 1.18 and latest 1.x.\n")
+process.stdout.write("PASS: clean-cache installation and startup CI cover the declared minimum, reported, and latest OpenCode 1.x.\n")

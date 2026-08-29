@@ -24,7 +24,7 @@
     "NOTICE.md"
   ],
   "scripts": {
-    "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
+    "build": "node scripts/build.mjs && tsc -p tsconfig.build.json && node scripts/prune-declarations.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bash scripts/test-skill-registry.sh && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs && node tests/package-publication.test.mjs && node tests/ci-workflow.test.mjs && node tests/publish-workflow.test.mjs && pnpm run test:install",
     "test:install": "node tests/clean-cache-install.test.mjs",
