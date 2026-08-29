@@ -125,7 +125,8 @@ function inodeKeySync(file) {
 }
 function isGeneratedPath(worktree, resolved) {
   const relative = path.relative(worktree, resolved);
-  return relative === ".atl" || relative.startsWith(`.atl${path.sep}`) || relative === ".ai" || relative.startsWith(`.ai${path.sep}`);
+  const generatedDirectory = path.join(".ai", "atl");
+  return relative === generatedDirectory || relative.startsWith(`${generatedDirectory}${path.sep}`);
 }
 async function collectConventionEntries(worktree) {
   const seenInodes = /* @__PURE__ */ new Set();
@@ -168,13 +169,6 @@ async function collectConventionEntries(worktree) {
 import crypto from "node:crypto";
 import fs2 from "node:fs/promises";
 import path2 from "node:path";
-async function directoryExists(dir) {
-  try {
-    return (await fs2.stat(dir)).isDirectory();
-  } catch {
-    return false;
-  }
-}
 async function readText(file) {
   try {
     return await fs2.readFile(file, "utf8");
@@ -199,18 +193,6 @@ async function ensureInfoExclude(worktree) {
     if (/(^|\n)\.ai\/?(\n|$)/.test(text)) return;
     await fs2.appendFile(exclude, text.endsWith("\n") ? ".ai/\n" : "\n.ai/\n");
   } catch {
-  }
-}
-async function migrateLegacyAtl(worktree) {
-  const legacyDir = path2.join(worktree, ".atl");
-  const aiDir = path2.join(worktree, ".ai");
-  const atlDir = path2.join(aiDir, "atl");
-  if (!await directoryExists(legacyDir) || await directoryExists(atlDir)) return;
-  try {
-    await fs2.mkdir(aiDir, { recursive: true });
-    await fs2.rename(legacyDir, atlDir);
-  } catch (error) {
-    console.error(`[skill-registry] legacy .atl migration failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 async function publishRegistry(worktree, markdown, renameFile = fs2.rename) {
@@ -249,7 +231,6 @@ function projectRoot(input) {
   return reportedWorktree;
 }
 async function generateRegistry(input, worktree) {
-  await migrateLegacyAtl(worktree);
   const [skills, conventions] = await Promise.all([
     loadOpenCodeSkills(input.client, input.directory),
     collectConventionEntries(worktree)

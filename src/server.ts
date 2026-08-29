@@ -2,7 +2,7 @@ import path from "node:path"
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { renderRegistry } from "./registry.js"
 import { collectConventionEntries, loadOpenCodeSkills } from "./source.js"
-import { migrateLegacyAtl, publishRegistry } from "./store.js"
+import { publishRegistry } from "./store.js"
 
 export const SKILL_REGISTRY_PLUGIN_ID = "andresnator.skill-registry"
 
@@ -17,7 +17,6 @@ function projectRoot(input: { worktree?: string; directory: string }) {
 }
 
 async function generateRegistry(input: PluginInput, worktree: string) {
-  await migrateLegacyAtl(worktree)
   const [skills, conventions] = await Promise.all([
     loadOpenCodeSkills(input.client, input.directory),
     collectConventionEntries(worktree),

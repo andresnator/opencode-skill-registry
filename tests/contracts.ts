@@ -5,13 +5,7 @@ import path from "node:path"
 import { classifySkillSource, renderRegistry } from "../src/registry.ts"
 import { SkillRegistryPlugin } from "../src/server.ts"
 import { collectConventionEntries, loadOpenCodeSkills, type OpenCodeSkill } from "../src/source.ts"
-import {
-  ensureInfoExclude,
-  migrateLegacyAtl,
-  publishRegistry,
-  registryFiles,
-  registryHash,
-} from "../src/store.ts"
+import { ensureInfoExclude, publishRegistry, registryFiles, registryHash } from "../src/store.ts"
 
 const WAIT_TIMEOUT_MS = 5_000
 const RETRY_WAIT_MS = 1_050
@@ -181,12 +175,13 @@ async function shouldLabelConventionsAsCompatibilityInventory(): Promise<void> {
   // Given
   const worktree = path.join(testRoot, "conventions")
   await fs.mkdir(path.join(worktree, "docs"), { recursive: true })
-  await fs.mkdir(path.join(worktree, ".ai"), { recursive: true })
+  await fs.mkdir(path.join(worktree, ".ai/atl"), { recursive: true })
   await fs.writeFile(path.join(worktree, "docs/rules.md"), "rules\n", "utf8")
-  await fs.writeFile(path.join(worktree, ".ai/ignored.md"), "ignored\n", "utf8")
+  await fs.writeFile(path.join(worktree, ".ai/reference.md"), "reference\n", "utf8")
+  await fs.writeFile(path.join(worktree, ".ai/atl/ignored.md"), "ignored\n", "utf8")
   await fs.writeFile(
     path.join(worktree, "AGENTS.md"),
-    "Read `docs/rules.md`, `.ai/ignored.md`, `../outside.md`, and `docs/*.md`.\n",
+    "Read `docs/rules.md`, `.ai/reference.md`, `.ai/atl/ignored.md`, `../outside.md`, and `docs/*.md`.\n",
     "utf8",
   )
 
@@ -198,6 +193,7 @@ async function shouldLabelConventionsAsCompatibilityInventory(): Promise<void> {
   assert.deepEqual(entries, [
     { file: "AGENTS.md", path: path.join(worktree, "AGENTS.md"), notes: "Detected compatibility convention" },
     { file: "rules.md", path: path.join(worktree, "docs/rules.md"), notes: "Referenced by AGENTS.md" },
+    { file: "reference.md", path: path.join(worktree, ".ai/reference.md"), notes: "Referenced by AGENTS.md" },
   ])
   assert.match(markdown, /Compatibility inventory only/)
   assert.doesNotMatch(markdown, /ignored\.md/)
@@ -252,30 +248,6 @@ async function shouldRepairAfterHashRenameFails(): Promise<void> {
   assert.equal((await fs.readFile(files.hashFile, "utf8")).trim(), registryHash(next))
   assert.deepEqual((await fs.readdir(path.dirname(files.registryFile))).filter((file) => file.endsWith(".tmp")), [])
   pass("shouldRepairAfterHashRenameFails")
-}
-
-async function shouldMigrateLegacyAtlWithoutOverwrite(): Promise<void> {
-  // Given
-  const migrated = path.join(testRoot, "migrate")
-  await fs.mkdir(path.join(migrated, ".atl"), { recursive: true })
-  await fs.writeFile(path.join(migrated, ".atl/marker.txt"), "legacy\n", "utf8")
-
-  // When
-  await migrateLegacyAtl(migrated)
-
-  // Then
-  assert.equal(await fs.readFile(path.join(migrated, ".ai/atl/marker.txt"), "utf8"), "legacy\n")
-  assert.equal(await exists(path.join(migrated, ".atl")), false)
-
-  const kept = path.join(testRoot, "migrate-existing")
-  await fs.mkdir(path.join(kept, ".atl"), { recursive: true })
-  await fs.writeFile(path.join(kept, ".atl/legacy.txt"), "legacy\n", "utf8")
-  await fs.mkdir(path.join(kept, ".ai/atl"), { recursive: true })
-  await fs.writeFile(path.join(kept, ".ai/atl/existing.txt"), "existing\n", "utf8")
-  await migrateLegacyAtl(kept)
-  assert.equal(await fs.readFile(path.join(kept, ".ai/atl/existing.txt"), "utf8"), "existing\n")
-  assert.equal(await exists(path.join(kept, ".atl/legacy.txt")), true)
-  pass("shouldMigrateLegacyAtlWithoutOverwrite")
 }
 
 async function shouldGenerateOnceAfterConfigAndIgnoreEventsAfterSuccess(): Promise<void> {
@@ -399,7 +371,6 @@ await shouldRenderAllSkillsInOpenCodeAgentsClaudeOrder()
 await shouldLabelConventionsAsCompatibilityInventory()
 await shouldSkipOnlyWhenHashAndRegistryContentMatch()
 await shouldRepairAfterHashRenameFails()
-await shouldMigrateLegacyAtlWithoutOverwrite()
 await shouldGenerateOnceAfterConfigAndIgnoreEventsAfterSuccess()
 await shouldRetryGenerationAfterFailure()
 await shouldBoundRetriesOnPersistentFailure()

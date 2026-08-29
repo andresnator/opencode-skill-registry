@@ -99,12 +99,8 @@ function inodeKeySync(file: string) {
 
 function isGeneratedPath(worktree: string, resolved: string) {
   const relative = path.relative(worktree, resolved)
-  return (
-    relative === ".atl" ||
-    relative.startsWith(`.atl${path.sep}`) ||
-    relative === ".ai" ||
-    relative.startsWith(`.ai${path.sep}`)
-  )
+  const generatedDirectory = path.join(".ai", "atl")
+  return relative === generatedDirectory || relative.startsWith(`${generatedDirectory}${path.sep}`)
 }
 
 export async function collectConventionEntries(worktree: string): Promise<ConventionEntry[]> {

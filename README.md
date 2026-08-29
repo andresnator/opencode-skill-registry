@@ -2,7 +2,16 @@
 
 [![npm version](https://img.shields.io/npm/v/opencode-skill-registry?logo=npm&label=npm)](https://www.npmjs.com/package/opencode-skill-registry)
 
-Generate a lightweight index of the skills resolved for an OpenCode project. The plugin creates one background snapshot per OpenCode session and writes only when the rendered index changes.
+Automatically generate a lightweight index of the skills active in an OpenCode project.
+
+When OpenCode opens or restarts in a project, the plugin creates or updates:
+
+```text
+<project>/.ai/atl/skill-registry.md
+<project>/.ai/atl/skill-registry.hash
+```
+
+There is no manual generation step and no `/skill` step for users. The plugin queries OpenCode's resolved skill list internally.
 
 ## Install
 
@@ -12,39 +21,54 @@ Requires OpenCode `>=1.17.15 <2`.
 opencode plugin opencode-skill-registry --global
 ```
 
-Restart OpenCode and open a project. The plugin creates:
-
-```text
-<project>/.ai/atl/skill-registry.md
-<project>/.ai/atl/skill-registry.hash
-```
+Restart OpenCode and open a project. The files appear automatically.
 
 ## Use
 
 Consumers match a description in `skill-registry.md`, then load that skill through OpenCode's native `skill` tool. Filesystem entries can also be read at their listed location. The registry is an index, not a copy of skill bodies.
 
-## Discovery
+## Sources
 
-The registry reads OpenCode's resolved `/skill` list instead of maintaining a second discovery implementation. It groups the active entries in this display order:
+OpenCode decides which skills are active. The registry groups that resolved list in this display order:
 
-| Order | Source | Examples |
-| ---: | --- | --- |
-| 1 | OpenCode | Built-in skills, `.opencode/{skill,skills}`, global config, `skills.paths`, and `skills.urls` |
-| 2 | Agents compatibility | Project and global `.agents/skills` |
-| 3 | Claude compatibility | Project and global `.claude/skills` |
+| Source | Includes |
+| --- | --- |
+| OpenCode | Built-in skills, `.opencode/{skill,skills}`, global config, `skills.paths`, and `skills.urls` |
+| Agents | Project and global `.agents/skills` |
+| Claude | Project and global `.claude/skills` |
 
-OpenCode resolves duplicate names before the plugin sees them, so the registry records the same active winner instead of imposing a separate precedence. Each entry includes the `name`, `description`, and `location` returned by `/skill`. Files such as `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, and `GEMINI.md` remain in a separate compatibility inventory; that section is not presented as OpenCode's active instruction set.
+OpenCode resolves duplicate names before the plugin sees them. The registry records the same winner instead of imposing separate precedence. Each entry includes the `name`, `description`, and `location` returned by OpenCode.
+
+### Convention references
+
+Files such as `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, and `GEMINI.md` appear in a separate reference section. They are not presented as active skills or as OpenCode's active instruction set.
 
 The plugin does not enable sources or inspect a Claude executable. OpenCode's `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS` and `OPENCODE_DISABLE_EXTERNAL_SKILLS` flags are reflected unchanged. A project-level `skills/` directory appears only when OpenCode resolves it, for example through `skills.paths`.
 
-## Behavior
+## Automatic cycle
+
+```mermaid
+flowchart TD
+    A[OpenCode opens a directory] --> B[config hook starts the plugin once]
+    B --> C[OpenCode resolves skills for that directory]
+    C --> D[Plugin renders the registry at the project root]
+    D --> E{Content and hash match?}
+    E -- Match --> F[Keep both files unchanged]
+    E -- Missing or changed --> G[Write the registry and hash]
+    F --> H[Snapshot stays fixed until restart]
+    G --> H
+```
+
+In Git, the project root is the root of the current worktree. Outside Git, it is the directory opened in OpenCode.
+
+Startup failures may retry up to three times during the same session. Retries recover a failed generation; they do not refresh a successful snapshot.
+
+## Storage details
 
 - Store generated state under project-local `.ai/atl/`.
-- Migrate legacy `.atl/` only when the new destination is absent.
 - Hash the exact rendered Markdown and repair a missing or corrupted registry.
 - Publish the registry and hash through same-directory temporary files.
 - Add `.ai/` to Git's local info exclude without editing tracked `.gitignore`.
-- Retry failed startup generation at most three times per session.
 - Keep a stable startup snapshot; restart OpenCode to include skills added during a session.
 - Query only the local OpenCode client; do not fetch configured skill URLs independently.
 

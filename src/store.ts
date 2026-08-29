@@ -9,14 +9,6 @@ export type RegistryFiles = {
 
 type RenameFile = (oldPath: string, newPath: string) => Promise<void>
 
-async function directoryExists(dir: string) {
-  try {
-    return (await fs.stat(dir)).isDirectory()
-  } catch {
-    return false
-  }
-}
-
 async function readText(file: string) {
   try {
     return await fs.readFile(file, "utf8")
@@ -45,21 +37,6 @@ export async function ensureInfoExclude(worktree: string) {
     await fs.appendFile(exclude, text.endsWith("\n") ? ".ai/\n" : "\n.ai/\n")
   } catch {
     // Non-git worktrees are valid OpenCode projects; skip local exclude updates.
-  }
-}
-
-export async function migrateLegacyAtl(worktree: string) {
-  const legacyDir = path.join(worktree, ".atl")
-  const aiDir = path.join(worktree, ".ai")
-  const atlDir = path.join(aiDir, "atl")
-
-  if (!(await directoryExists(legacyDir)) || (await directoryExists(atlDir))) return
-
-  try {
-    await fs.mkdir(aiDir, { recursive: true })
-    await fs.rename(legacyDir, atlDir)
-  } catch (error) {
-    console.error(`[skill-registry] legacy .atl migration failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
