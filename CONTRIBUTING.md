@@ -10,7 +10,7 @@ pnpm run check
 pnpm run security:check
 ```
 
-CI also verifies a first npm installation with an empty cache on OpenCode 1.18.0, 1.18.20, and the latest 1.x release.
+CI also verifies a first npm installation with an empty cache on OpenCode 1.17.15, 1.18.20, and the latest 1.x release.
 
 Keep one behavior per change. Update its tests and public documentation before opening a pull request. Do not rewrite `pnpm-lock.yaml` with npm, Yarn, or another pnpm version.
 
@@ -27,7 +27,7 @@ Keep the checkout at that path, restart OpenCode, and verify generated files und
 ## Preserve contracts
 
 - Keep discovery provider- and harness-independent.
-- Preserve project-over-user precedence and symlink safety.
+- Preserve exact parity with OpenCode's resolved `/skill` list; do not add a parallel filesystem resolver or precedence rules.
 - Keep generated state project-local and hash-gated.
 - Keep runtime npm dependencies at zero.
 - Add observable behavior contracts to `tests/contracts.ts`.

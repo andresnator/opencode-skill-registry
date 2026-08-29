@@ -1,177 +1,112 @@
 // src/server.ts
-import crypto from "node:crypto";
-import { statSync } from "node:fs";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-var FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
-var FORMAT_VERSION = "3";
-var SKILL_REGISTRY_PLUGIN_ID = "andresnator.skill-registry";
-function scalar(frontmatter, key) {
-  const lines = frontmatter.split(/\r?\n/);
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index];
-    const direct = line.match(new RegExp(`^\\s*${key}:\\s*(.*)$`));
-    if (!direct) continue;
-    const value = direct[1].trim();
-    if (value === ">" || value === "|" || value === ">-" || value === "|-") {
-      const block = [];
-      for (let next = index + 1; next < lines.length; next++) {
-        if (!/^\s+/.test(lines[next])) break;
-        block.push(lines[next].trim());
-      }
-      return block.join(" ").trim();
-    }
-    return value.replace(/^["']|["']$/g, "").trim();
-  }
-  return "";
-}
-function triggerFrom(description) {
-  const match = description.match(/Trigger:\s*([^.\n]+)/i);
-  const trigger = (match?.[1] ?? description).replace(/\s+/g, " ").trim();
-  if (trigger.length <= 120) return trigger;
-  return `${trigger.slice(0, 119)}\u2026`;
+import path3 from "node:path";
+
+// src/registry.ts
+var SOURCE_SECTIONS = [
+  { source: "opencode", heading: "OpenCode Skills" },
+  { source: "agents", heading: "Agent Skills" },
+  { source: "claude", heading: "Claude Skills" }
+];
+var AGENTS_SKILL_PATH = /(?:^|\/)\.agents\/skills(?:\/|$)/;
+var CLAUDE_SKILL_PATH = /(?:^|\/)\.claude\/skills(?:\/|$)/;
+function classifySkillSource(location) {
+  const normalized = location.replaceAll("\\", "/");
+  if (AGENTS_SKILL_PATH.test(normalized)) return "agents";
+  if (CLAUDE_SKILL_PATH.test(normalized)) return "claude";
+  return "opencode";
 }
 function tableCell(value) {
   return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ").trim();
 }
-async function directoryExists(dir) {
-  try {
-    return (await fs.stat(dir)).isDirectory();
-  } catch {
-    return false;
-  }
+function compareNames(left, right) {
+  if (left.name < right.name) return -1;
+  if (left.name > right.name) return 1;
+  return 0;
 }
-async function parseSkill(file, project) {
-  const stat = await fs.stat(file);
-  const text = await fs.readFile(file, "utf8");
-  const frontmatter = text.match(FRONTMATTER_RE)?.[1] ?? "";
-  const name = scalar(frontmatter, "name") || path.basename(path.dirname(file));
-  if (name === "skill-registry") return void 0;
-  return {
-    name,
-    version: scalar(frontmatter, "version") || "0.0.0",
-    status: scalar(frontmatter, "status") || "",
-    description: scalar(frontmatter, "description"),
-    path: file,
-    mtimeMs: stat.mtimeMs,
-    project
-  };
+function renderSkillSection(heading, skills) {
+  const rows = skills.sort(compareNames).map((skill) => `| ${tableCell(skill.description ?? "-")} | ${tableCell(skill.name)} | ${tableCell(skill.location)} |`).join("\n");
+  return `## ${heading}
+
+| Description | Skill | Location |
+|---|---|---|
+${rows || "| - | - | - |"}`;
 }
-var SKIPPED_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", ".venv", "dist", "build", "target"]);
-async function listSkillFiles(dir, seenDirs = /* @__PURE__ */ new Set()) {
-  const out = [];
-  async function walk(current, depth = 0) {
-    let realCurrent;
-    try {
-      realCurrent = await fs.realpath(current);
-    } catch {
-      return;
-    }
-    if (seenDirs.has(realCurrent)) return;
-    seenDirs.add(realCurrent);
-    let entries;
-    try {
-      entries = await fs.readdir(current, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (depth > 0 && SKIPPED_DIRS.has(entry.name)) continue;
-      const full = path.join(current, entry.name);
-      let entryStat;
-      try {
-        entryStat = await fs.stat(full);
-      } catch {
-        continue;
-      }
-      if (entryStat.isDirectory()) await walk(full, depth + 1);
-      else if (entryStat.isFile() && entry.name === "SKILL.md") out.push(full);
-    }
-  }
-  await walk(dir);
-  return [...new Set(out)];
-}
-async function discoverSkills(worktree) {
-  const home = os.homedir();
-  const roots = [
-    { dir: path.join(worktree, ".opencode/skills"), project: true },
-    { dir: path.join(worktree, ".agents/skills"), project: true },
-    { dir: path.join(worktree, "skills"), project: true },
-    { dir: path.join(home, ".config/opencode/skills"), project: false }
-  ];
-  const seenDirs = /* @__PURE__ */ new Set();
-  const byName = /* @__PURE__ */ new Map();
-  for (const root of roots) {
-    for (const file of await listSkillFiles(root.dir, seenDirs)) {
-      const skill = await parseSkill(file, root.project);
-      if (!skill) continue;
-      const existing = byName.get(skill.name);
-      if (!existing || skill.project && !existing.project) byName.set(skill.name, skill);
-    }
-  }
-  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
-}
-async function collectConventions(worktree) {
-  const seenInodes = /* @__PURE__ */ new Set();
-  const conventionFiles = ["AGENTS.md", "agents.md", "CLAUDE.md", ".cursorrules", "GEMINI.md", "copilot-instructions.md"].map((file) => path.join(worktree, file)).filter((file) => {
-    const inode = inodeKeySync(file);
-    if (!inode || seenInodes.has(inode)) return false;
-    seenInodes.add(inode);
-    return true;
-  });
-  const rows = [];
-  const seen = /* @__PURE__ */ new Set();
-  const hashParts = [];
-  async function addHash(file) {
-    try {
-      const text = await fs.readFile(file, "utf8");
-      const digest = crypto.createHash("sha256").update(text).digest("hex");
-      hashParts.push(`${file}@${digest}`);
-      return text;
-    } catch {
-      return "";
-    }
-  }
-  for (const file of conventionFiles) {
-    rows.push(`| ${tableCell(path.basename(file))} | ${tableCell(file)} | Project convention file |`);
-    seen.add(file);
-    const text = await addHash(file);
-    if (!text) continue;
-    for (const match of text.matchAll(/`([^`]+)`/g)) {
-      const candidate = match[1];
-      if (!candidate || candidate.includes("*") || candidate.includes("{")) continue;
-      const resolved = path.resolve(worktree, candidate);
-      const relative = path.relative(worktree, resolved);
-      if (relative === ".atl" || relative.startsWith(`.atl${path.sep}`) || relative === ".ai" || relative.startsWith(`.ai${path.sep}`)) {
-        continue;
-      }
-      if (!resolved.startsWith(worktree + path.sep) || seen.has(resolved) || !regularFileSync(resolved)) continue;
-      seen.add(resolved);
-      await addHash(resolved);
-      rows.push(`| ${tableCell(path.basename(resolved))} | ${tableCell(resolved)} | Referenced by ${tableCell(path.basename(file))} |`);
-    }
-  }
-  return { rows: rows.join("\n"), hashInput: hashParts.sort().join("\n") };
-}
-async function renderRegistry(skills, conventions) {
-  const userRows = skills.map((skill) => `| ${tableCell(triggerFrom(skill.description) || "-")} | ${tableCell(skill.name)} | ${tableCell(skill.path)} |`).join("\n");
+function renderRegistry(skills, conventions) {
+  const skillSections = SOURCE_SECTIONS.map(
+    ({ source, heading }) => renderSkillSection(heading, skills.filter((skill) => classifySkillSource(skill.location) === source))
+  ).join("\n\n");
+  const conventionRows = conventions.map((entry) => `| ${tableCell(entry.file)} | ${tableCell(entry.path)} | ${tableCell(entry.notes)} |`).join("\n");
   return `# Skill Registry
 
-Auto-generated \u2014 do not edit. Discovery index only: match a trigger, then read the skill's SKILL.md at the listed path for its full contract.
+Auto-generated \u2014 do not edit. Discovery index of the skills active in this OpenCode session. Match a description, then load the skill with OpenCode's \`skill\` tool; filesystem locations can also be read directly.
 
-## Skills
+${skillSections}
 
-| Trigger | Skill | Path |
-|---|---|---|
-${userRows || "| - | - | - |"}
+## Detected Convention Files
 
-## Project Conventions
+Compatibility inventory only. These files are not presented as the active instruction set resolved by OpenCode.
 
 | File | Path | Notes |
 |---|---|---|
-${conventions.rows || "| - | - | - |"}
+${conventionRows || "| - | - | - |"}
 `;
+}
+
+// src/source.ts
+import { statSync } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+var CONVENTION_FILE_NAMES = [
+  "AGENTS.md",
+  "agents.md",
+  "CLAUDE.md",
+  ".cursorrules",
+  "GEMINI.md",
+  "copilot-instructions.md"
+];
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function resultData(result) {
+  if (!isRecord(result)) return result;
+  if ("error" in result && result.error !== void 0 && result.error !== null) {
+    const detail = result.error instanceof Error ? result.error.message : String(result.error);
+    throw new Error(`OpenCode /skill request failed: ${detail}`);
+  }
+  return "data" in result ? result.data : result;
+}
+function normalizeSkills(value) {
+  if (!Array.isArray(value)) throw new TypeError("OpenCode /skill returned a non-array response");
+  const seenNames = /* @__PURE__ */ new Set();
+  return value.map((item, index) => {
+    if (!isRecord(item)) throw new TypeError(`OpenCode /skill returned an invalid entry at index ${index}`);
+    if (typeof item.name !== "string") throw new TypeError(`OpenCode /skill entry ${index} has no string name`);
+    if (typeof item.location !== "string") throw new TypeError(`OpenCode /skill entry ${index} has no string location`);
+    if (item.description !== void 0 && typeof item.description !== "string") {
+      throw new TypeError(`OpenCode /skill entry ${index} has an invalid description`);
+    }
+    if (seenNames.has(item.name)) throw new TypeError(`OpenCode /skill returned duplicate name: ${item.name}`);
+    seenNames.add(item.name);
+    return {
+      name: item.name,
+      description: item.description,
+      location: item.location
+    };
+  });
+}
+async function loadOpenCodeSkills(client, directory) {
+  const app = client.app;
+  let result;
+  if (typeof app?.skills === "function") {
+    result = await app.skills.call(app, { directory });
+  } else {
+    const legacy = client._client;
+    if (typeof legacy?.get !== "function") {
+      throw new Error("OpenCode client does not expose the /skill transport");
+    }
+    result = await legacy.get.call(legacy, { url: "/skill" });
+  }
+  return normalizeSkills(resultData(result));
 }
 function regularFileSync(file) {
   try {
@@ -188,69 +123,123 @@ function inodeKeySync(file) {
     return "";
   }
 }
+function isGeneratedPath(worktree, resolved) {
+  const relative = path.relative(worktree, resolved);
+  const generatedDirectory = path.join(".ai", "atl");
+  return relative === generatedDirectory || relative.startsWith(`${generatedDirectory}${path.sep}`);
+}
+async function collectConventionEntries(worktree) {
+  const seenInodes = /* @__PURE__ */ new Set();
+  const conventionFiles = CONVENTION_FILE_NAMES.map((file) => path.join(worktree, file)).filter((file) => {
+    const inode = inodeKeySync(file);
+    if (!inode || seenInodes.has(inode)) return false;
+    seenInodes.add(inode);
+    return true;
+  });
+  const entries = [];
+  const seenPaths = /* @__PURE__ */ new Set();
+  for (const file of conventionFiles) {
+    entries.push({ file: path.basename(file), path: file, notes: "Detected compatibility convention" });
+    seenPaths.add(file);
+    let text;
+    try {
+      text = await fs.readFile(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const match of text.matchAll(/`([^`]+)`/g)) {
+      const candidate = match[1];
+      if (!candidate || candidate.includes("*") || candidate.includes("{")) continue;
+      const resolved = path.resolve(worktree, candidate);
+      const relative = path.relative(worktree, resolved);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+      if (isGeneratedPath(worktree, resolved) || seenPaths.has(resolved) || !regularFileSync(resolved)) continue;
+      seenPaths.add(resolved);
+      entries.push({
+        file: path.basename(resolved),
+        path: resolved,
+        notes: `Referenced by ${path.basename(file)}`
+      });
+    }
+  }
+  return entries;
+}
+
+// src/store.ts
+import crypto from "node:crypto";
+import fs2 from "node:fs/promises";
+import path2 from "node:path";
+async function readText(file) {
+  try {
+    return await fs2.readFile(file, "utf8");
+  } catch {
+    return void 0;
+  }
+}
+function registryHash(markdown) {
+  return crypto.createHash("sha256").update(markdown, "utf8").digest("hex");
+}
+function registryFiles(worktree) {
+  const atlDir = path2.join(worktree, ".ai", "atl");
+  return {
+    registryFile: path2.join(atlDir, "skill-registry.md"),
+    hashFile: path2.join(atlDir, "skill-registry.hash")
+  };
+}
 async function ensureInfoExclude(worktree) {
-  const exclude = path.join(worktree, ".git/info/exclude");
+  const exclude = path2.join(worktree, ".git/info/exclude");
   try {
-    const text = await fs.readFile(exclude, "utf8");
+    const text = await fs2.readFile(exclude, "utf8");
     if (/(^|\n)\.ai\/?(\n|$)/.test(text)) return;
-    await fs.appendFile(exclude, text.endsWith("\n") ? ".ai/\n" : "\n.ai/\n");
+    await fs2.appendFile(exclude, text.endsWith("\n") ? ".ai/\n" : "\n.ai/\n");
   } catch {
   }
 }
-async function migrateLegacyAtl(worktree) {
-  const legacyDir = path.join(worktree, ".atl");
-  const aiDir = path.join(worktree, ".ai");
-  const atlDir = path.join(aiDir, "atl");
-  if (!await directoryExists(legacyDir) || await directoryExists(atlDir)) return;
-  try {
-    await fs.mkdir(aiDir, { recursive: true });
-    await fs.rename(legacyDir, atlDir);
-  } catch (error) {
-    console.error(`[skill-registry] legacy .atl migration failed: ${error instanceof Error ? error.message : String(error)}`);
+async function publishRegistry(worktree, markdown, renameFile = fs2.rename) {
+  const files = registryFiles(worktree);
+  const atlDir = path2.dirname(files.registryFile);
+  const expectedHash = registryHash(markdown);
+  await fs2.mkdir(atlDir, { recursive: true });
+  const [storedHash, currentRegistry] = await Promise.all([readText(files.hashFile), readText(files.registryFile)]);
+  if (storedHash?.trim() === expectedHash && currentRegistry !== void 0 && registryHash(currentRegistry) === expectedHash) {
+    await ensureInfoExclude(worktree);
+    return false;
   }
-}
-async function generateRegistry(worktree) {
-  await migrateLegacyAtl(worktree);
-  const skills = await discoverSkills(worktree);
-  const conventions = await collectConventions(worktree);
-  const orderedHashInput = skills.map((skill) => `${skill.name}@${skill.version}@${skill.mtimeMs}`).sort().join("\n");
-  const hash = crypto.createHash("sha256").update(`${FORMAT_VERSION}
-${orderedHashInput}
-${conventions.hashInput}`).digest("hex");
-  const atlDir = path.join(worktree, ".ai", "atl");
-  const hashFile = path.join(atlDir, "skill-registry.hash");
-  const registryFile = path.join(atlDir, "skill-registry.md");
-  await fs.mkdir(atlDir, { recursive: true });
+  const suffix = `${process.pid}-${crypto.randomUUID()}.tmp`;
+  const registryTemp = `${files.registryFile}.${suffix}`;
+  const hashTemp = `${files.hashFile}.${suffix}`;
   try {
-    if ((await fs.readFile(hashFile, "utf8")).trim() === hash) return;
-  } catch {
-  }
-  await fs.writeFile(registryFile, await renderRegistry(skills, conventions), "utf8");
-  await fs.writeFile(hashFile, `${hash}
+    await fs2.writeFile(registryTemp, markdown, "utf8");
+    await fs2.writeFile(hashTemp, `${expectedHash}
 `, "utf8");
+    await renameFile(registryTemp, files.registryFile);
+    await renameFile(hashTemp, files.hashFile);
+  } finally {
+    await Promise.allSettled([fs2.rm(registryTemp, { force: true }), fs2.rm(hashTemp, { force: true })]);
+  }
   await ensureInfoExclude(worktree);
+  return true;
 }
-function projectRoot(input) {
-  const reportedWorktree = input.worktree ?? "";
-  if (!reportedWorktree || reportedWorktree === path.parse(reportedWorktree).root) return input.directory;
-  return reportedWorktree;
-}
-var skillRegistryContracts = {
-  scalar,
-  triggerFrom,
-  listSkillFiles,
-  discoverSkills,
-  collectConventions,
-  renderRegistry,
-  ensureInfoExclude,
-  migrateLegacyAtl,
-  generateRegistry,
-  projectRoot
-};
+
+// src/server.ts
+var SKILL_REGISTRY_PLUGIN_ID = "andresnator.skill-registry";
 var MAX_RETRIES = 3;
 var RETRY_COOLDOWN_MS = 1e3;
+function projectRoot(input) {
+  const reportedWorktree = input.worktree ?? "";
+  if (!reportedWorktree || reportedWorktree === path3.parse(reportedWorktree).root) return input.directory;
+  return reportedWorktree;
+}
+async function generateRegistry(input, worktree) {
+  const [skills, conventions] = await Promise.all([
+    loadOpenCodeSkills(input.client, input.directory),
+    collectConventionEntries(worktree)
+  ]);
+  await publishRegistry(worktree, renderRegistry(skills, conventions));
+}
 var SkillRegistryPlugin = async (input) => {
   const root = projectRoot(input);
+  let started = false;
   let failed = false;
   let running = false;
   let retries = 0;
@@ -258,7 +247,8 @@ var SkillRegistryPlugin = async (input) => {
   const run = async () => {
     running = true;
     try {
-      await generateRegistry(root);
+      await generateRegistry(input, root);
+      failed = false;
       retries = 0;
     } catch (error) {
       failed = true;
@@ -273,9 +263,13 @@ var SkillRegistryPlugin = async (input) => {
       running = false;
     }
   };
-  void run();
   return {
-    "event": async () => {
+    config: async () => {
+      if (started) return;
+      started = true;
+      void run();
+    },
+    event: async () => {
       if (!failed || running) return;
       if (retries >= MAX_RETRIES) return;
       if (retries > 0 && Date.now() < nextRetryAt) return;
@@ -292,6 +286,5 @@ var server_default = {
 export {
   SKILL_REGISTRY_PLUGIN_ID,
   SkillRegistryPlugin,
-  server_default as default,
-  skillRegistryContracts
+  server_default as default
 };

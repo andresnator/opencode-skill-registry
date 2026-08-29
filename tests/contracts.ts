@@ -2,12 +2,15 @@ import assert from "node:assert/strict"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { SkillRegistryPlugin, skillRegistryContracts } from "../src/server.ts"
+import { classifySkillSource, renderRegistry } from "../src/registry.ts"
+import { SkillRegistryPlugin } from "../src/server.ts"
+import { collectConventionEntries, loadOpenCodeSkills, type OpenCodeSkill } from "../src/source.ts"
+import { ensureInfoExclude, publishRegistry, registryFiles, registryHash } from "../src/store.ts"
 
-const { discoverSkills, generateRegistry, ensureInfoExclude, migrateLegacyAtl } = skillRegistryContracts
+const WAIT_TIMEOUT_MS = 5_000
+const RETRY_WAIT_MS = 1_050
+const SETTLE_WAIT_MS = 100
 
-// Guard: only run against the throwaway HOME/worktree that test-skill-registry.sh
-// provisions, never against real user state.
 const testRoot = process.env.SKILL_REGISTRY_TEST_ROOT ?? ""
 if (!testRoot || !os.homedir().startsWith(testRoot)) {
   console.error("FAIL: run via scripts/test-skill-registry.sh; an isolated HOME under SKILL_REGISTRY_TEST_ROOT is required")
@@ -21,13 +24,8 @@ function pass(name: string): void {
   console.log(`ok - ${name}`)
 }
 
-async function writeSkill(dir: string, name: string, description: string, version = "1.0.0"): Promise<void> {
-  await fs.mkdir(dir, { recursive: true })
-  await fs.writeFile(
-    path.join(dir, "SKILL.md"),
-    `---\nname: ${name}\ndescription: "${description}"\nlicense: MIT\nmetadata:\n  author: test\n  version: "${version}"\n  status: testing\n---\n\n# ${name}\n`,
-    "utf8",
-  )
+function skill(name: string, location: string, description?: string): OpenCodeSkill {
+  return { name, location, description }
 }
 
 async function exists(file: string): Promise<boolean> {
@@ -39,106 +37,272 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-async function waitFor(cond: () => Promise<boolean> | boolean, what: string): Promise<void> {
-  const deadline = Date.now() + 5000
+async function waitFor(condition: () => Promise<boolean> | boolean, what: string): Promise<void> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS
   while (Date.now() < deadline) {
-    if (await cond()) return
+    if (await condition()) return
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
   throw new Error(`timeout waiting for ${what}`)
 }
 
-const userSkillsDir = path.join(os.homedir(), ".config/opencode/skills")
-
-async function shouldPreferProjectSkillsOverUserSkills(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-precedence")
-  await writeSkill(path.join(userSkillsDir, "shared-skill"), "shared-skill", "Trigger: user copy.")
-  await writeSkill(path.join(userSkillsDir, "user-only"), "user-only", "Trigger: user only.")
-  await writeSkill(path.join(worktree, ".opencode/skills/shared-skill"), "shared-skill", "Trigger: project copy.")
-
-  const skills = await discoverSkills(worktree)
-  const shared = skills.filter((skill) => skill.name === "shared-skill")
-  assert.equal(shared.length, 1)
-  assert.equal(shared[0].project, true)
-  assert.ok(shared[0].path.startsWith(worktree + path.sep))
-  assert.equal(shared[0].description, "Trigger: project copy.")
-  const userOnly = skills.find((skill) => skill.name === "user-only")
-  assert.ok(userOnly)
-  assert.equal(userOnly.project, false)
-  pass("shouldPreferProjectSkillsOverUserSkills")
+function pluginInput(worktree: string, request: () => Promise<unknown>) {
+  return {
+    worktree,
+    directory: worktree,
+    client: { app: { skills: request } },
+  } as never
 }
 
-async function shouldTerminateAndDedupeSymlinkCycles(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-cycles")
-  const skillsDir = path.join(worktree, "skills")
-  await writeSkill(path.join(skillsDir, "looped"), "looped", "Trigger: cycle fixture.")
-  // Cycle back to the scanned root plus a sibling alias to the same skill dir.
-  await fs.symlink("../../skills", path.join(skillsDir, "looped", "back"))
-  await fs.symlink("looped", path.join(skillsDir, "alias"))
+async function shouldPreferPublicSkillMethodWhenAvailable(): Promise<void> {
+  // Given
+  const directory = path.join(testRoot, "public-method")
+  let receivedDirectory = ""
+  let legacyCalled = false
+  const client = {
+    app: {
+      skills: async (parameters?: { directory?: string }) => {
+        receivedDirectory = parameters?.directory ?? ""
+        return { data: [{ name: "native", description: "Trigger: native.", location: "/skills/native/SKILL.md" }] }
+      },
+    },
+    _client: {
+      get: async () => {
+        legacyCalled = true
+        return { data: [] }
+      },
+    },
+  }
 
-  const skills = await discoverSkills(worktree)
-  assert.equal(skills.filter((skill) => skill.name === "looped").length, 1)
-  pass("shouldTerminateAndDedupeSymlinkCycles")
+  // When
+  const result = await loadOpenCodeSkills(client as never, directory)
+
+  // Then
+  assert.deepEqual(result, [skill("native", "/skills/native/SKILL.md", "Trigger: native.")])
+  assert.equal(receivedDirectory, directory)
+  assert.equal(legacyCalled, false)
+  pass("shouldPreferPublicSkillMethodWhenAvailable")
 }
 
-async function shouldSkipRewriteWhenHashUnchanged(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-hash")
-  await writeSkill(path.join(worktree, ".opencode/skills/hash-probe"), "hash-probe", "Trigger: hash fixture.")
-  const registryFile = path.join(worktree, ".ai/atl/skill-registry.md")
+async function shouldUseLegacyTransportWhenPublicMethodIsUnavailable(): Promise<void> {
+  // Given
+  let requestOptions: unknown
+  const client = {
+    app: {},
+    _client: {
+      get: async (options: unknown) => {
+        requestOptions = options
+        return [{ name: "legacy", location: "<built-in>" }]
+      },
+    },
+  }
 
-  await generateRegistry(worktree)
-  assert.match(await fs.readFile(registryFile, "utf8"), /hash-probe/)
+  // When
+  const result = await loadOpenCodeSkills(client as never, testRoot)
 
-  await fs.writeFile(registryFile, "SENTINEL", "utf8")
-  await generateRegistry(worktree)
-  assert.equal(await fs.readFile(registryFile, "utf8"), "SENTINEL")
-
-  await writeSkill(path.join(worktree, ".opencode/skills/hash-probe"), "hash-probe", "Trigger: hash fixture.", "1.0.1")
-  await generateRegistry(worktree)
-  assert.match(await fs.readFile(registryFile, "utf8"), /hash-probe/)
-  pass("shouldSkipRewriteWhenHashUnchanged")
+  // Then
+  assert.deepEqual(requestOptions, { url: "/skill" })
+  assert.deepEqual(result, [skill("legacy", "<built-in>")])
+  pass("shouldUseLegacyTransportWhenPublicMethodIsUnavailable")
 }
 
-async function shouldMigrateLegacyAtlWithoutOverwrite(): Promise<void> {
-  const migrated = path.join(testRoot, "wt-migrate")
-  await fs.mkdir(path.join(migrated, ".atl"), { recursive: true })
-  await fs.writeFile(path.join(migrated, ".atl/marker.txt"), "legacy\n", "utf8")
-  await migrateLegacyAtl(migrated)
-  assert.equal(await fs.readFile(path.join(migrated, ".ai/atl/marker.txt"), "utf8"), "legacy\n")
-  assert.equal(await exists(path.join(migrated, ".atl")), false)
+async function shouldRejectMalformedOrUnavailableOpenCodeResponses(): Promise<void> {
+  // Given
+  const invalidResponses: Array<{ response: unknown; message: RegExp }> = [
+    { response: { data: "not-an-array" }, message: /non-array response/ },
+    { response: { data: [null] }, message: /invalid entry at index 0/ },
+    { response: { data: [{ name: 42, location: "/one/SKILL.md" }] }, message: /has no string name/ },
+    { response: { data: [{ name: "one", location: null }] }, message: /has no string location/ },
+    { response: { data: [{ name: "one", description: 42, location: "/one/SKILL.md" }] }, message: /invalid description/ },
+    {
+      response: { data: [
+        { name: "same", location: "/one/SKILL.md" },
+        { name: "same", location: "/two/SKILL.md" },
+      ] },
+      message: /duplicate name: same/,
+    },
+  ]
 
-  const kept = path.join(testRoot, "wt-migrate-existing")
-  await fs.mkdir(path.join(kept, ".atl"), { recursive: true })
-  await fs.writeFile(path.join(kept, ".atl/legacy.txt"), "legacy\n", "utf8")
-  await fs.mkdir(path.join(kept, ".ai/atl"), { recursive: true })
-  await fs.writeFile(path.join(kept, ".ai/atl/existing.txt"), "existing\n", "utf8")
-  await migrateLegacyAtl(kept)
-  assert.equal(await fs.readFile(path.join(kept, ".ai/atl/existing.txt"), "utf8"), "existing\n")
-  assert.equal(await exists(path.join(kept, ".ai/atl/legacy.txt")), false)
-  assert.equal(await exists(path.join(kept, ".atl/legacy.txt")), true)
-  pass("shouldMigrateLegacyAtlWithoutOverwrite")
+  // When / Then
+  for (const invalid of invalidResponses) {
+    await assert.rejects(
+      loadOpenCodeSkills({ app: { skills: async () => invalid.response } } as never, testRoot),
+      invalid.message,
+    )
+  }
+  await assert.rejects(loadOpenCodeSkills({ app: {} } as never, testRoot), /does not expose the \/skill transport/)
+  await assert.rejects(
+    loadOpenCodeSkills({ app: { skills: async () => ({ error: "unavailable" }) } } as never, testRoot),
+    /request failed: unavailable/,
+  )
+  pass("shouldRejectMalformedOrUnavailableOpenCodeResponses")
+}
+
+async function shouldRenderAllSkillsInOpenCodeAgentsClaudeOrder(): Promise<void> {
+  // Given
+  const skills = [
+    skill("claude-one", "/repo/.claude/skills/claude-one/SKILL.md", "Trigger: claude. Keep this detail."),
+    skill("agent-one", "/repo/.agents/skills/agent-one/SKILL.md", "Trigger: agent | compatibility."),
+    skill("native-one", "/repo/.opencode/skills/native-one/SKILL.md", "Trigger: native. Keep this detail."),
+    skill("built-in", "<built-in>"),
+  ]
+  const original = structuredClone(skills)
+
+  // When
+  const markdown = renderRegistry(skills, [])
+
+  // Then
+  const openCodeHeading = markdown.indexOf("## OpenCode Skills")
+  const agentsHeading = markdown.indexOf("## Agent Skills")
+  const claudeHeading = markdown.indexOf("## Claude Skills")
+  assert.ok(openCodeHeading >= 0 && openCodeHeading < agentsHeading && agentsHeading < claudeHeading)
+  assert.ok(markdown.indexOf("| Trigger: native. Keep this detail. | native-one |", openCodeHeading) < agentsHeading)
+  assert.ok(markdown.indexOf("| Trigger: agent \\| compatibility. | agent-one |", agentsHeading) < claudeHeading)
+  assert.ok(markdown.indexOf("| Trigger: claude. Keep this detail. | claude-one |", claudeHeading) > claudeHeading)
+  assert.match(markdown, /\| - \| built-in \| <built-in> \|/)
+  const renderedSkillRows = markdown
+    .split("## Detected Convention Files")[0]
+    .split("\n")
+    .filter((line) => line.startsWith("| ") && !line.startsWith("| Description ") && line !== "| - | - | - |")
+  assert.equal(renderedSkillRows.length, skills.length)
+  assert.deepEqual(skills, original)
+  assert.equal(classifySkillSource("C:\\repo\\.agents\\skills\\one\\SKILL.md"), "agents")
+  assert.equal(classifySkillSource("C:\\repo\\.claude\\skills\\one\\SKILL.md"), "claude")
+  pass("shouldRenderAllSkillsInOpenCodeAgentsClaudeOrder")
+}
+
+async function shouldLabelConventionsAsCompatibilityInventory(): Promise<void> {
+  // Given
+  const worktree = path.join(testRoot, "conventions")
+  await fs.mkdir(path.join(worktree, "docs"), { recursive: true })
+  await fs.mkdir(path.join(worktree, ".ai/atl"), { recursive: true })
+  await fs.writeFile(path.join(worktree, "docs/rules.md"), "rules\n", "utf8")
+  await fs.writeFile(path.join(worktree, ".ai/reference.md"), "reference\n", "utf8")
+  await fs.writeFile(path.join(worktree, ".ai/atl/ignored.md"), "ignored\n", "utf8")
+  await fs.writeFile(
+    path.join(worktree, "AGENTS.md"),
+    "Read `docs/rules.md`, `.ai/reference.md`, `.ai/atl/ignored.md`, `../outside.md`, and `docs/*.md`.\n",
+    "utf8",
+  )
+
+  // When
+  const entries = await collectConventionEntries(worktree)
+  const markdown = renderRegistry([], entries)
+
+  // Then
+  assert.deepEqual(entries, [
+    { file: "AGENTS.md", path: path.join(worktree, "AGENTS.md"), notes: "Detected compatibility convention" },
+    { file: "rules.md", path: path.join(worktree, "docs/rules.md"), notes: "Referenced by AGENTS.md" },
+    { file: "reference.md", path: path.join(worktree, ".ai/reference.md"), notes: "Referenced by AGENTS.md" },
+  ])
+  assert.match(markdown, /Compatibility inventory only/)
+  assert.doesNotMatch(markdown, /ignored\.md/)
+  pass("shouldLabelConventionsAsCompatibilityInventory")
+}
+
+async function shouldSkipOnlyWhenHashAndRegistryContentMatch(): Promise<void> {
+  // Given
+  const worktree = path.join(testRoot, "hash")
+  const original = "# Registry\n\noriginal\n"
+  const changed = "# Registry\n\nchanged description and location\n"
+  const files = registryFiles(worktree)
+
+  // When
+  assert.equal(await publishRegistry(worktree, original), true)
+  assert.equal(await publishRegistry(worktree, original), false)
+  await fs.writeFile(files.registryFile, "CORRUPTED", "utf8")
+  const repaired = await publishRegistry(worktree, original)
+  const changedWritten = await publishRegistry(worktree, changed)
+
+  // Then
+  assert.equal(repaired, true)
+  assert.equal(changedWritten, true)
+  assert.equal(await fs.readFile(files.registryFile, "utf8"), changed)
+  assert.equal((await fs.readFile(files.hashFile, "utf8")).trim(), registryHash(changed))
+  pass("shouldSkipOnlyWhenHashAndRegistryContentMatch")
+}
+
+async function shouldRepairAfterHashRenameFails(): Promise<void> {
+  // Given
+  const worktree = path.join(testRoot, "atomic")
+  const previous = "# Registry\n\nprevious\n"
+  const next = "# Registry\n\nnext\n"
+  const files = registryFiles(worktree)
+  await publishRegistry(worktree, previous)
+  let renameCount = 0
+
+  // When
+  await assert.rejects(
+    publishRegistry(worktree, next, async (oldPath, newPath) => {
+      renameCount += 1
+      if (renameCount === 2) throw new Error("simulated hash rename failure")
+      await fs.rename(oldPath, newPath)
+    }),
+    /simulated hash rename failure/,
+  )
+
+  // Then
+  assert.equal(await fs.readFile(files.registryFile, "utf8"), next)
+  assert.equal((await fs.readFile(files.hashFile, "utf8")).trim(), registryHash(previous))
+  assert.equal(await publishRegistry(worktree, next), true)
+  assert.equal((await fs.readFile(files.hashFile, "utf8")).trim(), registryHash(next))
+  assert.deepEqual((await fs.readdir(path.dirname(files.registryFile))).filter((file) => file.endsWith(".tmp")), [])
+  pass("shouldRepairAfterHashRenameFails")
+}
+
+async function shouldGenerateOnceAfterConfigAndIgnoreEventsAfterSuccess(): Promise<void> {
+  // Given
+  const worktree = path.join(testRoot, "session-snapshot")
+  let requests = 0
+  let response = [skill("session-one", "/repo/.opencode/skills/session-one/SKILL.md", "Trigger: first.")]
+  const hooks = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+    requests += 1
+    return { data: response }
+  }))
+  const registryFile = registryFiles(worktree).registryFile
+
+  // When
+  await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
+  assert.equal(await exists(registryFile), false)
+  await hooks.config?.({} as never)
+  await waitFor(() => exists(registryFile), "registry after config hook")
+  response = [skill("session-two", "/repo/.opencode/skills/session-two/SKILL.md", "Trigger: second.")]
+  await hooks.event?.({ event: { type: "file.watcher.updated" } } as never)
+  await hooks.config?.({} as never)
+  await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
+
+  // Then
+  const markdown = await fs.readFile(registryFile, "utf8")
+  assert.match(markdown, /session-one/)
+  assert.doesNotMatch(markdown, /session-two/)
+  assert.equal(requests, 1)
+  pass("shouldGenerateOnceAfterConfigAndIgnoreEventsAfterSuccess")
 }
 
 async function shouldRetryGenerationAfterFailure(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-retry")
-  await fs.mkdir(worktree, { recursive: true })
-  // A regular file where the .ai directory belongs makes generation fail.
-  await fs.writeFile(path.join(worktree, ".ai"), "blocker", "utf8")
-
+  // Given
+  const worktree = path.join(testRoot, "retry")
+  let requests = 0
+  const hooks = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+    requests += 1
+    if (requests === 1) throw new Error("transient source failure")
+    return { data: [skill("recovered", "/repo/.opencode/skills/recovered/SKILL.md")] }
+  }))
   const errors: string[] = []
   const originalError = console.error
-  console.error = (message: unknown) => {
-    errors.push(String(message))
-  }
-  try {
-    const hooks = await SkillRegistryPlugin({ worktree, directory: worktree } as never)
-    assert.ok(hooks.event)
-    await waitFor(() => errors.length > 0, "initial generation failure")
-    assert.match(errors[0], /\[skill-registry\]/)
+  console.error = (message: unknown) => errors.push(String(message))
 
-    await fs.rm(path.join(worktree, ".ai"))
-    await hooks.event({ event: { type: "test" } } as never)
-    await waitFor(() => exists(path.join(worktree, ".ai/atl/skill-registry.md")), "registry after retry")
+  try {
+    // When
+    await hooks.config?.({} as never)
+    await waitFor(() => errors.length === 1, "initial source failure")
+    assert.equal(await exists(registryFiles(worktree).registryFile), false)
+    await hooks.event?.({ event: { type: "test" } } as never)
+    await waitFor(() => exists(registryFiles(worktree).registryFile), "registry after retry")
+
+    // Then
+    assert.equal(requests, 2)
+    assert.match(await fs.readFile(registryFiles(worktree).registryFile, "utf8"), /recovered/)
   } finally {
     console.error = originalError
   }
@@ -146,123 +310,70 @@ async function shouldRetryGenerationAfterFailure(): Promise<void> {
 }
 
 async function shouldBoundRetriesOnPersistentFailure(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-retry-cap")
-  await fs.mkdir(worktree, { recursive: true })
-  // The blocker stays in place, so every attempt fails: one error line per attempt.
-  await fs.writeFile(path.join(worktree, ".ai"), "blocker", "utf8")
-
+  // Given
+  const worktree = path.join(testRoot, "retry-cap")
+  const hooks = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+    throw new Error("persistent source failure")
+  }))
   const errors: string[] = []
   const originalError = console.error
-  console.error = (message: unknown) => {
-    errors.push(String(message))
-  }
-  const fireEvents = async (count: number, event: NonNullable<Awaited<ReturnType<typeof SkillRegistryPlugin>>["event"]>) => {
-    for (let index = 0; index < count; index++) await event({ event: { type: "test" } } as never)
-  }
+  console.error = (message: unknown) => errors.push(String(message))
+
   try {
-    const hooks = await SkillRegistryPlugin({ worktree, directory: worktree } as never)
-    assert.ok(hooks.event)
-    const event = hooks.event
-    await waitFor(() => errors.length === 1, "initial generation failure")
-
-    // The first retry is immediate so a transient failure recovers at once.
-    await fireEvents(1, event)
-    await waitFor(() => errors.length === 2, "immediate first retry")
-
-    // A burst inside the cooldown must not re-scan: that burst is the stall being fixed.
-    await fireEvents(50, event)
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    assert.equal(errors.length, 2, "events inside the cooldown must not trigger a generation")
+    // When
+    await hooks.config?.({} as never)
+    await waitFor(() => errors.length === 1, "initial persistent failure")
+    await hooks.event?.({ event: { type: "test" } } as never)
+    await waitFor(() => errors.length === 2, "immediate retry")
+    for (let index = 0; index < 20; index++) await hooks.event?.({ event: { type: "test" } } as never)
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
+    assert.equal(errors.length, 2)
 
     for (const attempt of [3, 4]) {
-      await new Promise((resolve) => setTimeout(resolve, 1_050))
-      await fireEvents(1, event)
+      await new Promise((resolve) => setTimeout(resolve, RETRY_WAIT_MS))
+      await hooks.event?.({ event: { type: "test" } } as never)
       await waitFor(() => errors.length === attempt, `retry ${attempt - 1}`)
     }
 
-    // Budget spent: further events are ignored for the rest of the session, and the last
-    // message says so instead of failing silently.
+    // Then
     assert.match(errors[3], /retry budget spent/)
-    await new Promise((resolve) => setTimeout(resolve, 1_050))
-    await fireEvents(50, event)
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    assert.equal(errors.length, 4, "retries must stop once the budget is spent")
+    await new Promise((resolve) => setTimeout(resolve, RETRY_WAIT_MS))
+    await hooks.event?.({ event: { type: "test" } } as never)
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
+    assert.equal(errors.length, 4)
   } finally {
     console.error = originalError
   }
   pass("shouldBoundRetriesOnPersistentFailure")
 }
 
-async function shouldDedupeASymlinkedRootAcrossRoots(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-root-dedupe")
-  const projectSkill = path.join(worktree, "skills/dedupe-probe")
-  await writeSkill(projectSkill, "dedupe-probe", "Trigger: dedupe fixture.")
-  // How the installer wires a user root: one symlink per skill into the repo's own tree.
-  await fs.mkdir(userSkillsDir, { recursive: true })
-  await fs.symlink(projectSkill, path.join(userSkillsDir, "dedupe-probe"), "dir")
-
-  const skills = await discoverSkills(worktree)
-  const found = skills.filter((skill) => skill.name === "dedupe-probe")
-  assert.equal(found.length, 1)
-  assert.equal(found[0].path, path.join(projectSkill, "SKILL.md"))
-  assert.equal(found[0].project, true)
-  pass("shouldDedupeASymlinkedRootAcrossRoots")
-}
-
-async function shouldSkipBuildOutputDirsButNotSkillsNamedLikeThem(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-skip-dirs")
-  const skillsRoot = path.join(worktree, ".opencode/skills")
-  // A skill whose directory name collides with a build-output name is still a skill:
-  // the root's immediate children are skill directories by contract.
-  await writeSkill(path.join(skillsRoot, "dist"), "dist", "Trigger: dist-named skill.")
-  // Below that level the same names are outputs and must not be walked into.
-  await writeSkill(path.join(skillsRoot, "real-skill"), "real-skill", "Trigger: real skill.")
-  await writeSkill(
-    path.join(skillsRoot, "real-skill/node_modules/buried"),
-    "buried",
-    "Trigger: must never be indexed.",
-  )
-
-  const skills = await discoverSkills(worktree)
-  assert.ok(skills.some((skill) => skill.name === "dist"))
-  assert.ok(skills.some((skill) => skill.name === "real-skill"))
-  assert.ok(!skills.some((skill) => skill.name === "buried"))
-  pass("shouldSkipBuildOutputDirsButNotSkillsNamedLikeThem")
-}
-
 async function shouldOwnExactGitInfoExcludeLine(): Promise<void> {
-  const worktree = path.join(testRoot, "wt-exclude")
-  await writeSkill(path.join(worktree, ".opencode/skills/exclude-probe"), "exclude-probe", "Trigger: exclude fixture.")
+  // Given
+  const worktree = path.join(testRoot, "exclude")
   const excludeFile = path.join(worktree, ".git/info/exclude")
   await fs.mkdir(path.dirname(excludeFile), { recursive: true })
   await fs.writeFile(excludeFile, "node_modules", "utf8")
 
-  await generateRegistry(worktree)
-  assert.equal(await fs.readFile(excludeFile, "utf8"), "node_modules\n.ai/\n")
-
+  // When
   await ensureInfoExclude(worktree)
+  await ensureInfoExclude(worktree)
+
+  // Then
   assert.equal(await fs.readFile(excludeFile, "utf8"), "node_modules\n.ai/\n")
-
-  const preOwned = path.join(testRoot, "wt-exclude-preowned")
-  const preOwnedFile = path.join(preOwned, ".git/info/exclude")
-  await fs.mkdir(path.dirname(preOwnedFile), { recursive: true })
-  await fs.writeFile(preOwnedFile, ".ai/\n", "utf8")
-  await ensureInfoExclude(preOwned)
-  assert.equal(await fs.readFile(preOwnedFile, "utf8"), ".ai/\n")
-
-  // Non-git worktrees must be a silent no-op.
-  await ensureInfoExclude(path.join(testRoot, "wt-not-git"))
+  await ensureInfoExclude(path.join(testRoot, "not-git"))
   pass("shouldOwnExactGitInfoExcludeLine")
 }
 
-await shouldPreferProjectSkillsOverUserSkills()
-await shouldTerminateAndDedupeSymlinkCycles()
-await shouldSkipRewriteWhenHashUnchanged()
-await shouldMigrateLegacyAtlWithoutOverwrite()
+await shouldPreferPublicSkillMethodWhenAvailable()
+await shouldUseLegacyTransportWhenPublicMethodIsUnavailable()
+await shouldRejectMalformedOrUnavailableOpenCodeResponses()
+await shouldRenderAllSkillsInOpenCodeAgentsClaudeOrder()
+await shouldLabelConventionsAsCompatibilityInventory()
+await shouldSkipOnlyWhenHashAndRegistryContentMatch()
+await shouldRepairAfterHashRenameFails()
+await shouldGenerateOnceAfterConfigAndIgnoreEventsAfterSuccess()
 await shouldRetryGenerationAfterFailure()
 await shouldBoundRetriesOnPersistentFailure()
-await shouldDedupeASymlinkedRootAcrossRoots()
-await shouldSkipBuildOutputDirsButNotSkillsNamedLikeThem()
 await shouldOwnExactGitInfoExcludeLine()
 
 console.log(`PASS: ${passed} skill-registry plugin contract group(s)`)

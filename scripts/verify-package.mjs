@@ -26,6 +26,9 @@ assert.deepEqual(
 const plugin = await import(pathToFileURL(bundleUrl.pathname).href)
 assert.equal(plugin.default?.id, "andresnator.skill-registry")
 assert.equal(typeof plugin.default?.server, "function")
+assert.equal(plugin.SKILL_REGISTRY_PLUGIN_ID, "andresnator.skill-registry")
+assert.equal(typeof plugin.SkillRegistryPlugin, "function")
+assert.equal("skillRegistryContracts" in plugin, false, "test-only contracts leaked into the published API")
 assert.equal("tui" in plugin.default, false, "server entry must not also export a TUI plugin")
 
 const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {

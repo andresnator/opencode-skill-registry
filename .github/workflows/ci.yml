@@ -59,14 +59,14 @@ jobs:
         run: git diff --exit-code -- dist
 
   install-compatibility:
-    name: clean-cache install (OpenCode ${{ matrix.label }})
+    name: clean-cache install and startup (OpenCode ${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - id: minimum-1-18
-            label: 1.18.0
-            version: 1.18.0
+          - id: declared-minimum
+            label: 1.17.15
+            version: 1.17.15
           - id: reported-version
             label: 1.18.20
             version: 1.18.20
