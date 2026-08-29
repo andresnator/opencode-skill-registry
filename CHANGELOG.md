@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.3...v0.2.0) (2026-08-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **registry:** Skill discovery and the generated registry format now mirror OpenCode /skill instead of the plugin-specific scan and precedence rules.
+
+### Features
+
+* **registry:** use OpenCode as the skill source of truth ([#11](https://github.com/andresnator/opencode-skill-registry/issues/11)) ([13b80f3](https://github.com/andresnator/opencode-skill-registry/commit/13b80f3f7be31c59d7232976f15c3434793ff1aa))
+
 ## [0.1.3](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.2...v0.1.3) (2026-08-27)
 
 
