@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-skill-registry",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packageManager": "pnpm@10.34.5",
   "description": "OpenCode plugin that generates a lightweight per-project index of skills and convention files.",
   "license": "MIT",

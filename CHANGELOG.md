@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/andresnator/opencode-skill-registry/compare/v0.2.0...v0.2.1) (2026-08-30)
+
+
+### Bug Fixes
+
+* **store:** stop writing .ai/ into .git/info/exclude ([#14](https://github.com/andresnator/opencode-skill-registry/issues/14)) ([9917589](https://github.com/andresnator/opencode-skill-registry/commit/99175899df37290ccb750bf97e71032a8c44b092))
+
 ## [0.2.0](https://github.com/andresnator/opencode-skill-registry/compare/v0.1.3...v0.2.0) (2026-08-29)
 
 
