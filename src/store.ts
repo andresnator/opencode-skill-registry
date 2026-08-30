@@ -29,17 +29,6 @@ export function registryFiles(worktree: string): RegistryFiles {
   }
 }
 
-export async function ensureInfoExclude(worktree: string) {
-  const exclude = path.join(worktree, ".git/info/exclude")
-  try {
-    const text = await fs.readFile(exclude, "utf8")
-    if (/(^|\n)\.ai\/?(\n|$)/.test(text)) return
-    await fs.appendFile(exclude, text.endsWith("\n") ? ".ai/\n" : "\n.ai/\n")
-  } catch {
-    // Non-git worktrees are valid OpenCode projects; skip local exclude updates.
-  }
-}
-
 export async function publishRegistry(
   worktree: string,
   markdown: string,
@@ -52,7 +41,6 @@ export async function publishRegistry(
   await fs.mkdir(atlDir, { recursive: true })
   const [storedHash, currentRegistry] = await Promise.all([readText(files.hashFile), readText(files.registryFile)])
   if (storedHash?.trim() === expectedHash && currentRegistry !== undefined && registryHash(currentRegistry) === expectedHash) {
-    await ensureInfoExclude(worktree)
     return false
   }
 
@@ -68,6 +56,5 @@ export async function publishRegistry(
     await Promise.allSettled([fs.rm(registryTemp, { force: true }), fs.rm(hashTemp, { force: true })])
   }
 
-  await ensureInfoExclude(worktree)
   return true
 }

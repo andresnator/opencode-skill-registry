@@ -5,7 +5,7 @@ import path from "node:path"
 import { classifySkillSource, renderRegistry } from "../src/registry.ts"
 import { SkillRegistryPlugin } from "../src/server.ts"
 import { collectConventionEntries, loadOpenCodeSkills, type OpenCodeSkill } from "../src/source.ts"
-import { ensureInfoExclude, publishRegistry, registryFiles, registryHash } from "../src/store.ts"
+import { publishRegistry, registryFiles, registryHash } from "../src/store.ts"
 
 const WAIT_TIMEOUT_MS = 5_000
 const RETRY_WAIT_MS = 1_050
@@ -347,23 +347,6 @@ async function shouldBoundRetriesOnPersistentFailure(): Promise<void> {
   pass("shouldBoundRetriesOnPersistentFailure")
 }
 
-async function shouldOwnExactGitInfoExcludeLine(): Promise<void> {
-  // Given
-  const worktree = path.join(testRoot, "exclude")
-  const excludeFile = path.join(worktree, ".git/info/exclude")
-  await fs.mkdir(path.dirname(excludeFile), { recursive: true })
-  await fs.writeFile(excludeFile, "node_modules", "utf8")
-
-  // When
-  await ensureInfoExclude(worktree)
-  await ensureInfoExclude(worktree)
-
-  // Then
-  assert.equal(await fs.readFile(excludeFile, "utf8"), "node_modules\n.ai/\n")
-  await ensureInfoExclude(path.join(testRoot, "not-git"))
-  pass("shouldOwnExactGitInfoExcludeLine")
-}
-
 await shouldPreferPublicSkillMethodWhenAvailable()
 await shouldUseLegacyTransportWhenPublicMethodIsUnavailable()
 await shouldRejectMalformedOrUnavailableOpenCodeResponses()
@@ -374,6 +357,5 @@ await shouldRepairAfterHashRenameFails()
 await shouldGenerateOnceAfterConfigAndIgnoreEventsAfterSuccess()
 await shouldRetryGenerationAfterFailure()
 await shouldBoundRetriesOnPersistentFailure()
-await shouldOwnExactGitInfoExcludeLine()
 
 console.log(`PASS: ${passed} skill-registry plugin contract group(s)`)

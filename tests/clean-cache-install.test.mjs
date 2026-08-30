@@ -245,7 +245,6 @@ async function shouldMatchResolvedOpenCodeSkillsAcrossFlags(
   for (const name of AGENT_SKILL_NAMES) assertRegistrySection(allSources, name, "Agent Skills")
   for (const name of CLAUDE_SKILL_NAMES) assertRegistrySection(allSources, name, "Claude Skills")
   for (const name of NATIVE_SKILL_NAMES) assertRegistrySection(allSources, name, "OpenCode Skills")
-  assert.match(await readFile(path.join(repositoryDirectory, ".git/info/exclude"), "utf8"), /(^|\n)\.ai\/(\n|$)/)
 }
 
 async function captureResolvedSnapshot(opencodeBin, environment, repositoryDirectory, sessionDirectory) {

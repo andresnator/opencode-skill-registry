@@ -186,15 +186,6 @@ function registryFiles(worktree) {
     hashFile: path2.join(atlDir, "skill-registry.hash")
   };
 }
-async function ensureInfoExclude(worktree) {
-  const exclude = path2.join(worktree, ".git/info/exclude");
-  try {
-    const text = await fs2.readFile(exclude, "utf8");
-    if (/(^|\n)\.ai\/?(\n|$)/.test(text)) return;
-    await fs2.appendFile(exclude, text.endsWith("\n") ? ".ai/\n" : "\n.ai/\n");
-  } catch {
-  }
-}
 async function publishRegistry(worktree, markdown, renameFile = fs2.rename) {
   const files = registryFiles(worktree);
   const atlDir = path2.dirname(files.registryFile);
@@ -202,7 +193,6 @@ async function publishRegistry(worktree, markdown, renameFile = fs2.rename) {
   await fs2.mkdir(atlDir, { recursive: true });
   const [storedHash, currentRegistry] = await Promise.all([readText(files.hashFile), readText(files.registryFile)]);
   if (storedHash?.trim() === expectedHash && currentRegistry !== void 0 && registryHash(currentRegistry) === expectedHash) {
-    await ensureInfoExclude(worktree);
     return false;
   }
   const suffix = `${process.pid}-${crypto.randomUUID()}.tmp`;
@@ -217,7 +207,6 @@ async function publishRegistry(worktree, markdown, renameFile = fs2.rename) {
   } finally {
     await Promise.allSettled([fs2.rm(registryTemp, { force: true }), fs2.rm(hashTemp, { force: true })]);
   }
-  await ensureInfoExclude(worktree);
   return true;
 }
 
