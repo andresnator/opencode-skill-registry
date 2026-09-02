@@ -40,11 +40,11 @@
     "opencode": ">=1.17.15 <2"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.13",
+    "@opencode-ai/plugin": "1.18.25",
     "@types/node": "24.13.3",
-    "esbuild": "0.28.1",
-    "opencode-ai": "1.18.13",
-    "tsx": "4.23.5",
+    "esbuild": "0.28.2",
+    "opencode-ai": "1.18.25",
+    "tsx": "4.23.13",
     "typescript": "5.9.3"
   },
   "publishConfig": {
