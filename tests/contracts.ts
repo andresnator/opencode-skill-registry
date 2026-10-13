@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import type { Plugin } from "@opencode/plugin"
-import { MAX_RETRIES, RETRY_COOLDOWN_MS, STARTUP_TIMEOUT_MS, NATIVE_SKILL_PROVIDER_IDS } from "../src/constants.ts"
+import { MAX_RETRIES, RETRY_COOLDOWN_MS, STARTUP_TIMEOUT_MS } from "../src/constants.ts"
 import { classifySkillSource, renderRegistry } from "../src/registry.ts"
 import plugin, { SkillRegistryPlugin } from "../src/server.ts"
 import { collectConventionEntries, loadOpenCodeSkills, type OpenCodeSkill } from "../src/source.ts"
@@ -30,19 +30,37 @@ function nativeResponse(skills: OpenCodeSkill[]) {
     data: skills.map(({ location, ...metadata }) => ({ ...metadata, path: location, content: "PRIVATE BODY MUST NOT BE INDEXED" })),
   }
 }
-function inventory() {
-  return { data: NATIVE_SKILL_PROVIDER_IDS.map((id) => ({ id, state: { status: "active" } })) }
-}
+const promptHooks = new WeakMap<Plugin.Context, () => Promise<void>>()
 function pluginInput(
   worktree: string,
   request: (input?: unknown, options?: { signal?: AbortSignal }) => Promise<unknown>,
-  plugins: () => Promise<unknown> = async () => inventory(),
 ): Plugin.Context {
-  return {
+  const context: Plugin.Context = {
     location: { directory: worktree, project: { directory: worktree, canonical: "/not-this-worktree" } },
     skill: { list: request },
-    plugin: { list: plugins },
+    plugin: { list: async () => { throw new Error("Partial plugin inventory is not an activation barrier") } },
+    session: {
+      hook: async (name: string, callback: (input: unknown) => Promise<void> | void) => {
+        assert.equal(name, "prompt")
+        promptHooks.set(context, async () => { await callback({}) })
+        return { dispose: async () => { promptHooks.delete(context) } }
+      },
+    },
   } as never
+  return context
+}
+async function sendPrompt(context: Plugin.Context): Promise<void> {
+  const hook = promptHooks.get(context)
+  assert.ok(hook, "setup must register the public prompt hook")
+  await hook()
+}
+async function startPrompt(context: Plugin.Context): Promise<() => Promise<void>> {
+  const cleanup = await SkillRegistryPlugin(context)
+  const generation = sendPrompt(context)
+  return async () => {
+    await cleanup?.()
+    await generation
+  }
 }
 async function exists(file: string): Promise<boolean> {
   try {
@@ -223,28 +241,24 @@ async function shouldRepairAfterHashRenameFails(): Promise<void> {
 }
 
 
-async function shouldGenerateOnceWhenV2SetupStarts(): Promise<void> {
+async function shouldDeferDiscoveryWhenSetupRegistersPromptHook(): Promise<void> {
   // Given
-  const worktree = path.join(testRoot, "session-snapshot")
+  const worktree = path.join(testRoot, "before-prompt")
   let requests = 0
-  let response = [skill("session-one", "/repo/.opencode/skills/session-one/SKILL.md", "Trigger: first.")]
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+  const context = pluginInput(worktree, async () => {
     requests += 1
-    return nativeResponse(response)
-  }))
-  const registryFile = registryFiles(worktree).registryFile
+    return nativeResponse([])
+  })
 
+  // When
+  const cleanup = await SkillRegistryPlugin(context)
   try {
-    // When
-    await waitFor(() => exists(registryFile), "registry after setup")
-    response = [skill("session-two", "/repo/.opencode/skills/session-two/SKILL.md", "Trigger: second.")]
     await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
 
     // Then
-    const markdown = await fs.readFile(registryFile, "utf8")
-    assert.match(markdown, /session-one/)
-    assert.doesNotMatch(markdown, /session-two|PRIVATE BODY/)
-    assert.equal(requests, 1)
+    assert.equal(requests, 0)
+    assert.equal(await exists(registryFiles(worktree).registryFile), false)
+    assert.equal(promptHooks.has(context), true)
     assert.equal(typeof cleanup, "function")
     assert.equal(plugin.id, "andresnator.skill-registry")
     assert.equal(plugin.setup, SkillRegistryPlugin)
@@ -252,34 +266,52 @@ async function shouldGenerateOnceWhenV2SetupStarts(): Promise<void> {
   } finally {
     await cleanup?.()
   }
-  pass("shouldGenerateOnceWhenV2SetupStarts")
+  pass("shouldDeferDiscoveryWhenSetupRegistersPromptHook")
 }
 
-async function shouldWaitForNativeProvidersWhenStartupIsIncomplete(): Promise<void> {
+async function shouldGenerateOnceWhenPromptsOverlap(): Promise<void> {
   // Given
-  const worktree = path.join(testRoot, "readiness")
-  let ready = false
+  const worktree = path.join(testRoot, "session-snapshot")
+  const files = registryFiles(worktree)
   let requests = 0
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+  let release!: (value: unknown) => void
+  const context = pluginInput(worktree, async () => {
     requests += 1
-    return nativeResponse([skill("complete", "/complete/SKILL.md")])
-  }, async () => ready ? inventory() : { data: [inventory().data[0]] }))
+    return new Promise((resolve) => { release = resolve })
+  })
+  const cleanup = await SkillRegistryPlugin(context)
+  let completed = 0
 
   try {
     // When
-    await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
-    assert.equal(requests, 0)
-    assert.equal(await exists(registryFiles(worktree).registryFile), false)
-    ready = true
-    await waitFor(() => exists(registryFiles(worktree).registryFile), "complete native snapshot")
+    const first = sendPrompt(context).then(() => { completed += 1 })
+    const second = sendPrompt(context).then(() => { completed += 1 })
+    await waitFor(() => requests > 0, "one discovery shared by concurrent prompts")
+    assert.equal(completed, 0)
+    assert.equal(requests, 1)
+    release(nativeResponse([skill("session-one", "/session-one/SKILL.md", "Trigger: first.")]))
+    await Promise.all([first, second])
+    const markdown = await fs.readFile(files.registryFile, "utf8")
+    const hash = await fs.readFile(files.hashFile, "utf8")
+    const mtime = (await fs.stat(files.registryFile)).mtimeMs
+    await sendPrompt(context)
 
     // Then
+    assert.deepEqual({
+      markdown: await fs.readFile(files.registryFile, "utf8"),
+      hash: await fs.readFile(files.hashFile, "utf8"),
+      mtime: (await fs.stat(files.registryFile)).mtimeMs,
+    }, { markdown, hash, mtime })
+    assert.equal(hash.trim(), registryHash(markdown))
+    assert.match(markdown, /session-one/)
+    assert.doesNotMatch(markdown, /PRIVATE BODY/)
     assert.equal(requests, 1)
-    assert.match(await fs.readFile(registryFiles(worktree).registryFile, "utf8"), /complete/)
+    assert.equal(completed, 2)
   } finally {
+    release?.(nativeResponse([]))
     await cleanup?.()
   }
-  pass("shouldWaitForNativeProvidersWhenStartupIsIncomplete")
+  pass("shouldGenerateOnceWhenPromptsOverlap")
 }
 
 async function shouldRetryGenerationWhenNativeRequestFails(): Promise<void> {
@@ -289,7 +321,7 @@ async function shouldRetryGenerationWhenNativeRequestFails(): Promise<void> {
   const originalError = console.error
   console.error = (message: unknown) => errors.push(String(message))
   let requests = 0
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+  const cleanup = await startPrompt(pluginInput(worktree, async () => {
     requests += 1
     if (requests === 1) throw new Error("transient source failure")
     return nativeResponse([skill("recovered", "/recovered/SKILL.md")])
@@ -317,11 +349,13 @@ async function shouldBoundRetriesWhenFailurePersists(): Promise<void> {
   const errors: string[] = []
   const originalError = console.error
   console.error = (message: unknown) => errors.push(String(message))
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async () => { throw new Error("persistent failure") }))
+  const context = pluginInput(worktree, async () => { throw new Error("persistent failure") })
+  const cleanup = await startPrompt(context)
 
   try {
     // When
     await waitFor(() => errors.length === MAX_RETRIES + 1, "retry budget")
+    await sendPrompt(context)
     await new Promise((resolve) => setTimeout(resolve, RETRY_COOLDOWN_MS + SETTLE_WAIT_MS))
 
     // Then
@@ -340,7 +374,7 @@ async function shouldCancelWorkWhenCleanupRuns(): Promise<void> {
   const worktree = path.join(testRoot, "cleanup")
   let resolve!: (value: unknown) => void
   let signal: AbortSignal | undefined
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async (_, options) => {
+  const cleanup = await startPrompt(pluginInput(worktree, async (_, options) => {
     signal = options?.signal
     return new Promise((done) => { resolve = done })
   }))
@@ -367,7 +401,7 @@ async function shouldRetryWhenNativeRequestTimesOut(): Promise<void> {
   const errors: string[] = []
   const originalError = console.error
   console.error = (message: unknown) => errors.push(String(message))
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async (_, options) => {
+  const cleanup = await startPrompt(pluginInput(worktree, async (_, options) => {
     requests += 1
     if (requests > 1) return nativeResponse([skill("recovered", "/recovered/SKILL.md")])
     signal = options?.signal
@@ -439,7 +473,7 @@ async function shouldCancelRetriesWhenCleanupRunsDuringCooldown(): Promise<void>
   let errors = 0
   let requests = 0
   console.error = () => { errors += 1 }
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+  const cleanup = await startPrompt(pluginInput(worktree, async () => {
     requests += 1
     throw new Error("retryable failure")
   }))
@@ -460,35 +494,28 @@ async function shouldCancelRetriesWhenCleanupRunsDuringCooldown(): Promise<void>
   pass("shouldCancelRetriesWhenCleanupRunsDuringCooldown")
 }
 
-async function shouldRejectSnapshotWhenNativeProviderFailed(): Promise<void> {
+async function shouldCancelBeforeDiscoveryWhenCleanupPrecedesFirstPrompt(): Promise<void> {
   // Given
-  const worktree = path.join(testRoot, "failed-provider")
-  const originalError = console.error
-  const errors: string[] = []
+  const worktree = path.join(testRoot, "cleanup-before-prompt")
   let requests = 0
-  console.error = (message: unknown) => errors.push(String(message))
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async () => {
+  const context = pluginInput(worktree, async () => {
     requests += 1
     return nativeResponse([])
-  }, async () => ({ data: [
-    { id: NATIVE_SKILL_PROVIDER_IDS[0], state: { status: "failed" } },
-    inventory().data[1],
-  ] })))
+  })
+  const cleanup = await SkillRegistryPlugin(context)
+  const pendingCallback = promptHooks.get(context)
+  assert.ok(pendingCallback)
 
-  try {
-    // When
-    await waitFor(() => errors.length === 1, "failed native provider")
-    await cleanup?.()
+  // When
+  await cleanup?.()
+  await cleanup?.()
+  await pendingCallback()
 
-    // Then
-    assert.match(errors[0], /native skill provider failed/)
-    assert.equal(requests, 0)
-    assert.equal(await exists(registryFiles(worktree).registryFile), false)
-  } finally {
-    await cleanup?.()
-    console.error = originalError
-  }
-  pass("shouldRejectSnapshotWhenNativeProviderFailed")
+  // Then
+  assert.equal(requests, 0)
+  assert.equal(promptHooks.has(context), false)
+  assert.equal(await exists(registryFiles(worktree).registryFile), false)
+  pass("shouldCancelBeforeDiscoveryWhenCleanupPrecedesFirstPrompt")
 }
 
 async function shouldAwaitPublicationWhenCleanupRunsAfterWritingStarts(): Promise<void> {
@@ -505,7 +532,7 @@ async function shouldAwaitPublicationWhenCleanupRunsAfterWritingStarts(): Promis
     }
     await originalRename(source, target)
   }
-  const cleanup = await SkillRegistryPlugin(pluginInput(worktree, async () => nativeResponse([])))
+  const cleanup = await startPrompt(pluginInput(worktree, async () => nativeResponse([])))
 
   try {
     // When
@@ -534,7 +561,7 @@ async function shouldUseOpenedDirectoryWhenProjectIsNotGit(): Promise<void> {
   const worktree = path.join(testRoot, "non-git/nested")
   const context = pluginInput(worktree, async () => nativeResponse([]))
   Object.assign(context.location.project, { directory: path.parse(worktree).root })
-  const cleanup = await SkillRegistryPlugin(context)
+  const cleanup = await startPrompt(context)
 
   try {
     // When
@@ -555,15 +582,15 @@ await shouldRenderAllSkillsInOpenCodeAgentsClaudeOrder()
 await shouldLabelConventionsAsCompatibilityInventory()
 await shouldSkipOnlyWhenHashAndRegistryContentMatch()
 await shouldRepairAfterHashRenameFails()
-await shouldGenerateOnceWhenV2SetupStarts()
-await shouldWaitForNativeProvidersWhenStartupIsIncomplete()
+await shouldDeferDiscoveryWhenSetupRegistersPromptHook()
+await shouldGenerateOnceWhenPromptsOverlap()
 await shouldRetryGenerationWhenNativeRequestFails()
 await shouldBoundRetriesWhenFailurePersists()
 await shouldCancelWorkWhenCleanupRuns()
 await shouldRetryWhenNativeRequestTimesOut()
 await shouldCancelConventionReadWhenSnapshotIsAborted()
 await shouldCancelRetriesWhenCleanupRunsDuringCooldown()
-await shouldRejectSnapshotWhenNativeProviderFailed()
+await shouldCancelBeforeDiscoveryWhenCleanupPrecedesFirstPrompt()
 await shouldAwaitPublicationWhenCleanupRunsAfterWritingStarts()
 await shouldUseOpenedDirectoryWhenProjectIsNotGit()
 

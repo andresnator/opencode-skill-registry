@@ -6,8 +6,6 @@ import { setTimeout as delay } from "node:timers/promises";
 var MAX_RETRIES = 3;
 var RETRY_COOLDOWN_MS = 1e3;
 var STARTUP_TIMEOUT_MS = 5e3;
-var READINESS_POLL_MS = 50;
-var NATIVE_SKILL_PROVIDER_IDS = ["opencode.config.compatibility", "opencode.config.skill"];
 
 // src/registry.ts
 var SOURCE_SECTIONS = [
@@ -213,16 +211,25 @@ function projectRoot(location) {
   if (!reportedWorktree || reportedWorktree === path3.parse(reportedWorktree).root) return location.directory;
   return reportedWorktree;
 }
-var SkillRegistryPlugin = (context) => {
+var SkillRegistryPlugin = async (context) => {
   const root = projectRoot(context.location);
   const lifetime = new AbortController();
-  const task = startup(context, root, lifetime.signal);
+  let task;
+  const registration = await context.session.hook("prompt", async () => {
+    if (lifetime.signal.aborted) return;
+    task ??= generateSnapshot(context, root, lifetime.signal);
+    await task;
+  });
   return async () => {
     lifetime.abort();
-    await task;
+    try {
+      await registration.dispose();
+    } finally {
+      await task;
+    }
   };
 };
-async function startup(context, root, lifetime) {
+async function generateSnapshot(context, root, lifetime) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (lifetime.aborted) return;
     try {
@@ -234,7 +241,7 @@ async function startup(context, root, lifetime) {
       if (lifetime.aborted) return;
       const detail = error instanceof Error ? error.message : String(error);
       const exhausted = attempt === MAX_RETRIES;
-      console.error(`[skill-registry] ${detail}${exhausted ? " \u2014 retry budget spent, giving up until the next session" : ""}`);
+      console.error(`[skill-registry] ${detail}${exhausted ? " \u2014 retry budget spent, giving up until reload or restart" : ""}`);
       if (exhausted) return;
       try {
         await delay(RETRY_COOLDOWN_MS, void 0, { signal: lifetime });
@@ -247,7 +254,7 @@ async function startup(context, root, lifetime) {
 async function prepareSnapshot(context, root, lifetime) {
   const timeout = new AbortController();
   const signal = AbortSignal.any([lifetime, timeout.signal]);
-  const timer = setTimeout(() => timeout.abort(new Error("OpenCode skill startup timed out")), STARTUP_TIMEOUT_MS);
+  const timer = setTimeout(() => timeout.abort(new Error("OpenCode skill snapshot timed out")), STARTUP_TIMEOUT_MS);
   try {
     return await abortable(renderSnapshot(context, root, signal), signal);
   } finally {
@@ -263,7 +270,6 @@ function abortable(work, signal) {
   });
 }
 async function renderSnapshot(context, root, signal) {
-  await waitForNativeSkills(context, signal);
   signal.throwIfAborted();
   const [skills, conventions] = await Promise.all([
     loadOpenCodeSkills(context, signal),
@@ -271,19 +277,6 @@ async function renderSnapshot(context, root, signal) {
   ]);
   signal.throwIfAborted();
   return renderRegistry(skills, conventions);
-}
-async function waitForNativeSkills(context, signal) {
-  while (!signal.aborted) {
-    const plugins = await context.plugin.list(void 0, { signal });
-    signal.throwIfAborted();
-    const providers = NATIVE_SKILL_PROVIDER_IDS.map((id) => plugins.data.find((plugin) => plugin.id === id));
-    if (providers.some((plugin) => plugin?.state.status === "failed")) {
-      throw new Error("OpenCode native skill provider failed to activate");
-    }
-    if (providers.every((plugin) => plugin?.state.status === "active")) return;
-    await delay(READINESS_POLL_MS, void 0, { signal });
-  }
-  signal.throwIfAborted();
 }
 var server_default = {
   id: SKILL_REGISTRY_PLUGIN_ID,

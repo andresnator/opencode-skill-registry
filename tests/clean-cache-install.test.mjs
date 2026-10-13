@@ -34,6 +34,10 @@ const AUTH_USERNAME = "opencode"
 const EQUAL_DISPLAY_NAME = "shared-display-name"
 const CONTRIBUTOR_IDS = ["fixture.early-contributor", "fixture.late-contributor"]
 const LATE_SKILL_ID = "late-added-skill"
+const DOWNLOADED_CONTRIBUTOR_ID = "fixture.downloaded-contributor"
+const CONTRIBUTOR_PACKAGE_NAME = "skill-registry-downloaded-contributor-fixture"
+const CONTRIBUTOR_PACKAGE_VERSION = "1.0.0"
+const DOWNLOAD_DELAY_MS = 1_500
 
 async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
   // Given
@@ -62,7 +66,8 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
   let registry
   try {
     const tarball = await packPackage(packageDirectory)
-    registry = await startRegistry(tarball, requests)
+    const contributor = await packContributorFixture(temporaryRoot)
+    registry = await startRegistry(tarball, requests, contributor)
     const isolatedEnvironment = {
       ...process.env,
       CI: "true",
@@ -113,7 +118,9 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
       sessionDirectory,
       version.stdout.trim(),
     )
-    process.stdout.write(`PASS: clean-cache install and resolved-skill startup succeed on OpenCode ${version.stdout.trim()}.\n`)
+    assert.ok(requests.includes(`GET /${CONTRIBUTOR_PACKAGE_NAME}`), "OpenCode did not resolve the uncached contributor")
+    assert.ok(requests.includes(`GET /${CONTRIBUTOR_PACKAGE_NAME}/-/${CONTRIBUTOR_PACKAGE_NAME}-${CONTRIBUTOR_PACKAGE_VERSION}.tgz`), "OpenCode did not download the contributor")
+    process.stdout.write(`PASS: clean-cache install and first-prompt native-skill parity succeed on OpenCode ${version.stdout.trim()}.\n`)
   } finally {
     await registry?.close()
     await rm(temporaryRoot, { recursive: true, force: true })
@@ -205,7 +212,7 @@ async function writeSkillFixtures({ configHome, homeDirectory, repositoryDirecto
   const contributors = await writeContributorFixtures(repositoryDirectory)
   await writeFile(
     path.join(repositoryDirectory, "opencode.json"),
-    `${JSON.stringify({ skills: ["./configured-skills"], plugins: contributors }, null, 2)}\n`,
+    `${JSON.stringify({ skills: ["./configured-skills"], plugins: [...contributors, `${CONTRIBUTOR_PACKAGE_NAME}@${CONTRIBUTOR_PACKAGE_VERSION}`] }, null, 2)}\n`,
     "utf8",
   )
 }
@@ -253,7 +260,7 @@ async function shouldMatchResolvedOpenCodeSkillsAcrossFlags(
 
   // Then
   assert.deepEqual(reordered.skills.map(skillTriple).sort(compareSkillTriples), allSources.skills.map(skillTriple).sort(compareSkillTriples))
-  assertSkillsPresent(allSources, CONTRIBUTOR_IDS)
+  assertSkillsPresent(allSources, [...CONTRIBUTOR_IDS, DOWNLOADED_CONTRIBUTOR_ID])
   assertSkillsPresent(allSources, [...NATIVE_SKILL_NAMES, ...AGENT_SKILL_NAMES, ...CLAUDE_SKILL_NAMES])
   assertSkillsAbsent(allSources, [PRIVATE_SKILL_NAME])
   // Characterize the installed release without imposing its ignored flags on future 2.x versions.
@@ -294,7 +301,9 @@ async function captureResolvedSnapshot(opencodeBin, environment, repositoryDirec
     // When
     await waitForBootstrap(client, location, server)
     await waitForRegistryPlugin(client, location, server)
-    await waitForFile(files.registry, server, files.hash)
+    assert.equal(await readFile(files.registry, "utf8"), "# Legacy V1 registry\n", "setup must not publish before a prompt")
+    assert.equal(await readFile(files.hash, "utf8"), "legacy-hash\n")
+    await sendPromptWithoutInference(client, location)
     const { data: skills } = await client.skill.list({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
     const markdown = await readFile(files.registry, "utf8")
     const unauthenticated = await fetch(`http://127.0.0.1:${port}/api/skill?directory=${encodeURIComponent(sessionDirectory)}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
@@ -316,6 +325,13 @@ async function captureResolvedSnapshot(opencodeBin, environment, repositoryDirec
   } finally {
     await server.stop()
   }
+}
+
+async function sendPromptWithoutInference(client, location) {
+  const session = await client.session.create({ location }, { signal: AbortSignal.timeout(RUNTIME_TIMEOUT_MS) })
+  await client.session.prompt({ sessionID: session.id, text: "Exercise the registry prompt hook.", resume: false }, {
+    signal: AbortSignal.timeout(RUNTIME_TIMEOUT_MS),
+  })
 }
 
 async function writeContributorFixtures(repositoryDirectory) {
@@ -355,11 +371,12 @@ async function shouldKeepSnapshotAndCleanUpWhenNativeLocationReloads(client, loc
 
   try {
     // When
-    await writeSkill(lateDirectory, LATE_SKILL_ID, "Native skills may change after the fixed startup snapshot.")
+    await writeSkill(lateDirectory, LATE_SKILL_ID, "Native skills may change after the fixed first-prompt snapshot.")
     await waitForCondition(async () => {
       const { data } = await client.skill.list({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       return data.some((entry) => entry.id === LATE_SKILL_ID)
     }, "native skill watcher update", server)
+    await sendPromptWithoutInference(client, location)
 
     // Then
     assert.deepEqual({
@@ -387,6 +404,21 @@ async function shouldKeepSnapshotAndCleanUpWhenNativeLocationReloads(client, loc
   // Then
   const { data } = await client.skill.list({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
   assert.equal(data.some((entry) => entry.id === LATE_SKILL_ID), false)
+  assert.deepEqual({
+    markdown: await readFile(files.registry, "utf8"),
+    hash: await readFile(files.hash, "utf8"),
+    mtime: (await stat(files.registry)).mtimeMs,
+  }, { markdown, hash, mtime: previous.mtimeMs }, "reload must defer generation until the next prompt")
+
+  // When
+  await writeFile(files.registry, "CORRUPTED AFTER RELOAD\n", "utf8")
+  await sendPromptWithoutInference(client, location)
+
+  // Then
+  assert.deepEqual({
+    markdown: await readFile(files.registry, "utf8"),
+    hash: await readFile(files.hash, "utf8"),
+  }, { markdown, hash }, "the first prompt after reload must repair the registry")
 }
 
 async function waitForCondition(condition, what, server) {
@@ -596,32 +628,67 @@ async function packPackage(destination) {
   return readFile(path.join(destination, `${PACKAGE_NAME}-${packageJson.version}.tgz`))
 }
 
-async function startRegistry(tarball, requests) {
+async function packContributorFixture(temporaryRoot) {
+  const directory = path.join(temporaryRoot, "contributor/package")
+  const manifest = {
+    name: CONTRIBUTOR_PACKAGE_NAME,
+    version: CONTRIBUTOR_PACKAGE_VERSION,
+    type: "module",
+    main: "./index.mjs",
+  }
+  await mkdir(directory, { recursive: true })
+  await writeFile(path.join(directory, "package.json"), JSON.stringify(manifest))
+  await writeFile(path.join(directory, "index.mjs"), `
+    export default {
+      id: ${JSON.stringify(DOWNLOADED_CONTRIBUTOR_ID)},
+      async setup(ctx) {
+        await ctx.skill.transform((editor) => editor.add({
+          id: ${JSON.stringify(DOWNLOADED_CONTRIBUTOR_ID)},
+          name: ${JSON.stringify(DOWNLOADED_CONTRIBUTOR_ID)},
+          description: "Contributor installed during the second activation pass.",
+          path: ${JSON.stringify(path.join(directory, "SKILL.md"))},
+          content: ${JSON.stringify(PRIVATE_SKILL_BODY)},
+        }))
+      },
+    }
+  `)
+  const archive = path.join(temporaryRoot, "contributor.tgz")
+  const result = spawnSync("tar", ["-czf", archive, "-C", path.dirname(directory), "package"], { encoding: "utf8" })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  return { manifest, tarball: await readFile(archive) }
+}
+
+async function startRegistry(tarball, requests, contributor) {
+  const packages = [{ manifest: packageJson, tarball }, contributor]
   const server = createServer((request, response) => {
     requests.push(`${request.method} ${request.url}`)
-    if (request.method === "GET" && request.url === `/${PACKAGE_NAME}`) {
-      const address = server.address()
-      assert.ok(address && typeof address === "object")
-      const tarballUrl = `http://127.0.0.1:${address.port}/${PACKAGE_NAME}/-/${PACKAGE_NAME}-${packageJson.version}.tgz`
-      return sendJson(response, {
-        name: PACKAGE_NAME,
-        "dist-tags": { latest: packageJson.version },
-        versions: {
-          [packageJson.version]: {
-            ...packageJson,
-            dist: {
-              integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
-              shasum: createHash("sha1").update(tarball).digest("hex"),
-              tarball: tarballUrl,
+    for (const { manifest, tarball } of packages) {
+      const { name, version } = manifest
+      const tarballPath = `/${name}/-/${name}-${version}.tgz`
+      if (request.method === "GET" && request.url === `/${name}`) {
+        const address = server.address()
+        assert.ok(address && typeof address === "object")
+        const metadata = {
+          name,
+          "dist-tags": { latest: version },
+          versions: {
+            [version]: {
+              ...manifest,
+              dist: {
+                integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+                shasum: createHash("sha1").update(tarball).digest("hex"),
+                tarball: `http://127.0.0.1:${address.port}${tarballPath}`,
+              },
             },
           },
-        },
-      })
-    }
-
-    if (request.method === "GET" && request.url === `/${PACKAGE_NAME}/-/${PACKAGE_NAME}-${packageJson.version}.tgz`) {
-      response.writeHead(200, { "content-length": tarball.length, "content-type": "application/octet-stream" })
-      return response.end(tarball)
+        }
+        if (name === CONTRIBUTOR_PACKAGE_NAME) return setTimeout(() => sendJson(response, metadata), DOWNLOAD_DELAY_MS)
+        return sendJson(response, metadata)
+      }
+      if (request.method === "GET" && request.url === tarballPath) {
+        response.writeHead(200, { "content-length": tarball.length, "content-type": "application/octet-stream" })
+        return response.end(tarball)
+      }
     }
 
     if (request.method === "POST" && request.url?.startsWith("/-/npm/v1/security/")) return sendJson(response, {})

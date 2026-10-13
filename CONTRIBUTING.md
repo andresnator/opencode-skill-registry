@@ -10,7 +10,7 @@ pnpm run check
 pnpm run security:check
 ```
 
-CI also verifies a first packed npm installation with an empty cache on OpenCode `2.0.28` and the latest `2.x` release. The fixture uses a password-protected foreground server, checks native metadata parity, and isolates HOME, configuration, cache, data, state, and temporary files.
+CI also verifies a first packed npm installation with an empty cache on OpenCode `2.0.28` and the latest `2.x` release. The fixture uses a password-protected foreground server, checks first-prompt native metadata parity with an uncached npm contributor, and isolates HOME, configuration, cache, data, state, and temporary files. Test prompts use `resume: false` to avoid inference.
 
 Keep one behavior per change. Update its tests and public documentation before opening a pull request. Do not rewrite `pnpm-lock.yaml` with npm, Yarn, or another pnpm version.
 
@@ -24,7 +24,7 @@ Build the checkout with `pnpm run build`, then add its absolute directory to `pl
 }
 ```
 
-Keep the checkout at that path, reload or restart OpenCode, and verify generated files under `.ai/atl/`. For an installed CLI instead of the development binary, run:
+Keep the checkout at that path, reload or restart OpenCode, send the first prompt, and verify generated files under `.ai/atl/`. For an installed CLI instead of the development binary, run:
 
 ```bash
 OPENCODE_BIN="$(command -v opencode)" pnpm run test:install
@@ -38,8 +38,9 @@ Do not modify real user configuration for automated tests. Follow the [official 
 - Preserve exact parity with OpenCode's native `ctx.skill.list()` metadata; do not add a parallel filesystem resolver or precedence rules.
 - Preserve distinct IDs with equal display names and never include skill bodies.
 - Use the typed V2 `id`/`setup` lifecycle; keep SDK imports type-only to preserve zero runtime dependencies.
-- Wait for the initial native contributor activation before publishing one snapshot; do not refresh a successful snapshot.
-- Cancel pending startup work on cleanup; await any publication already started.
+- Generate once in the public `ctx.session.hook("prompt")`, after OpenCode awaits full activation including pending package installs; do not use partial plugin inventory as a readiness barrier.
+- Make concurrent prompts await the same fixed snapshot; do not refresh it or reset the retry budget on later prompts.
+- Cancel pending generation on cleanup; remove the hook and await any publication already started.
 - Keep generated state project-local and hash-gated.
 - Keep runtime npm dependencies at zero.
 - Add observable behavior contracts to `tests/contracts.ts`.

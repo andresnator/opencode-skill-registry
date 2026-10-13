@@ -1,7 +1,7 @@
 import path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import type { Plugin } from "@opencode/plugin"
-import { MAX_RETRIES, RETRY_COOLDOWN_MS, STARTUP_TIMEOUT_MS, READINESS_POLL_MS, NATIVE_SKILL_PROVIDER_IDS } from "./constants.js"
+import { MAX_RETRIES, RETRY_COOLDOWN_MS, STARTUP_TIMEOUT_MS } from "./constants.js"
 import { renderRegistry } from "./registry.js"
 import { collectConventionEntries, loadOpenCodeSkills } from "./source.js"
 import { publishRegistry } from "./store.js"
@@ -15,18 +15,30 @@ function projectRoot(location: Plugin.Context["location"]) {
   return reportedWorktree
 }
 
-export const SkillRegistryPlugin: Plugin.Plugin["setup"] = (context) => {
+export const SkillRegistryPlugin: Plugin.Plugin["setup"] = async (context) => {
   const root = projectRoot(context.location)
   const lifetime = new AbortController()
-  const task = startup(context, root, lifetime.signal)
+  let task: Promise<void> | undefined
+  // OpenCode awaits full activation, including pending package installs, before this hook.
+  // Share one awaited snapshot across concurrent prompts and keep it fixed until unload.
+  const registration = await context.session.hook("prompt", async () => {
+    if (lifetime.signal.aborted) return
+    task ??= generateSnapshot(context, root, lifetime.signal)
+    await task
+  })
 
   return async () => {
     lifetime.abort()
-    await task
+    try {
+      await registration.dispose()
+    } finally {
+      // Publication is not cancellable; cleanup waits for any write already started.
+      await task
+    }
   }
 }
 
-async function startup(context: Plugin.Context, root: string, lifetime: AbortSignal) {
+async function generateSnapshot(context: Plugin.Context, root: string, lifetime: AbortSignal) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (lifetime.aborted) return
     try {
@@ -39,7 +51,7 @@ async function startup(context: Plugin.Context, root: string, lifetime: AbortSig
       if (lifetime.aborted) return
       const detail = error instanceof Error ? error.message : String(error)
       const exhausted = attempt === MAX_RETRIES
-      console.error(`[skill-registry] ${detail}${exhausted ? " — retry budget spent, giving up until the next session" : ""}`)
+      console.error(`[skill-registry] ${detail}${exhausted ? " — retry budget spent, giving up until reload or restart" : ""}`)
       if (exhausted) return
       try {
         await delay(RETRY_COOLDOWN_MS, undefined, { signal: lifetime })
@@ -53,7 +65,7 @@ async function startup(context: Plugin.Context, root: string, lifetime: AbortSig
 async function prepareSnapshot(context: Plugin.Context, root: string, lifetime: AbortSignal) {
   const timeout = new AbortController()
   const signal = AbortSignal.any([lifetime, timeout.signal])
-  const timer = setTimeout(() => timeout.abort(new Error("OpenCode skill startup timed out")), STARTUP_TIMEOUT_MS)
+  const timer = setTimeout(() => timeout.abort(new Error("OpenCode skill snapshot timed out")), STARTUP_TIMEOUT_MS)
   try {
     return await abortable(renderSnapshot(context, root, signal), signal)
   } finally {
@@ -71,7 +83,6 @@ function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 async function renderSnapshot(context: Plugin.Context, root: string, signal: AbortSignal) {
-  await waitForNativeSkills(context, signal)
   signal.throwIfAborted()
   const [skills, conventions] = await Promise.all([
     loadOpenCodeSkills(context, signal),
@@ -79,22 +90,6 @@ async function renderSnapshot(context: Plugin.Context, root: string, signal: Abo
   ])
   signal.throwIfAborted()
   return renderRegistry(skills, conventions)
-}
-
-async function waitForNativeSkills(context: Plugin.Context, signal: AbortSignal) {
-  // V2 activates contributors after user setup; blocking setup would deadlock activation.
-  // The public inventory is published after the activation batch, not after each setup.
-  while (!signal.aborted) {
-    const plugins = await context.plugin.list(undefined, { signal })
-    signal.throwIfAborted()
-    const providers = NATIVE_SKILL_PROVIDER_IDS.map((id) => plugins.data.find((plugin) => plugin.id === id))
-    if (providers.some((plugin) => plugin?.state.status === "failed")) {
-      throw new Error("OpenCode native skill provider failed to activate")
-    }
-    if (providers.every((plugin) => plugin?.state.status === "active")) return
-    await delay(READINESS_POLL_MS, undefined, { signal })
-  }
-  signal.throwIfAborted()
 }
 
 export default {
