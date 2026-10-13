@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { readFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { pathToFileURL } from "node:url"
 
 const root = new URL("../", import.meta.url)
@@ -13,7 +15,7 @@ assert.equal(packageJson.dependencies, undefined, "published package must not ha
 assert.equal(packageJson.exports?.["."]?.import, "./dist/server.js")
 assert.equal(packageJson.exports?.["./server"]?.import, "./dist/server.js")
 assert.equal(packageJson.engines?.node, ">=22.0.0")
-assert.equal(packageJson.engines?.opencode, ">=1.17.15 <2")
+assert.equal(packageJson.engines?.opencode, ">=2.0.28 <3")
 assert.ok(!bundle.includes("agents-orchestrator"), "bundle still contains source-harness coupling")
 
 const bareImports = [...bundle.matchAll(/\b(?:from\s+|import\s*\()(["'])([^"']+)\1/g)].map((match) => match[2])
@@ -25,7 +27,8 @@ assert.deepEqual(
 
 const plugin = await import(pathToFileURL(bundleUrl.pathname).href)
 assert.equal(plugin.default?.id, "andresnator.skill-registry")
-assert.equal(typeof plugin.default?.server, "function")
+assert.equal(typeof plugin.default?.setup, "function")
+assert.equal("server" in plugin.default, false, "V1 lifecycle leaked into the V2 entrypoint")
 assert.equal(plugin.SKILL_REGISTRY_PLUGIN_ID, "andresnator.skill-registry")
 assert.equal(typeof plugin.SkillRegistryPlugin, "function")
 assert.equal("skillRegistryContracts" in plugin, false, "test-only contracts leaked into the published API")
@@ -45,4 +48,28 @@ for (const forbidden of ["src/server.ts", "tests/contracts.ts", ".github/workflo
   assert.ok(!files.has(forbidden), `package unexpectedly contains ${forbidden}`)
 }
 
-process.stdout.write(`PASS: package contains ${files.size} files and no runtime dependencies.\n`)
+const isolatedRoot = await mkdtemp(path.join(tmpdir(), "skill-registry-package-"))
+try {
+  const installed = path.join(isolatedRoot, "node_modules", packageJson.name)
+  await mkdir(installed, { recursive: true })
+  const packedArtifact = spawnSync("pnpm", ["pack", "--pack-destination", isolatedRoot], { cwd: root, encoding: "utf8" })
+  assert.equal(packedArtifact.status, 0, packedArtifact.stderr || packedArtifact.stdout)
+  const unpacked = spawnSync("tar", ["-xzf", path.join(isolatedRoot, `${packageJson.name}-${packageJson.version}.tgz`), "--strip-components=1", "-C", installed], { encoding: "utf8" })
+  assert.equal(unpacked.status, 0, unpacked.stderr || unpacked.stdout)
+  const imported = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import assert from "node:assert/strict"
+    for (const entry of ["opencode-skill-registry", "opencode-skill-registry/server"]) {
+      const module = await import(entry)
+      assert.equal(module.default.id, "andresnator.skill-registry")
+      assert.equal(module.default.setup, module.SkillRegistryPlugin)
+      assert.equal(typeof module.default.setup, "function")
+      assert.equal("server" in module.default, false)
+    }
+  `], { cwd: isolatedRoot, encoding: "utf8" })
+  assert.equal(imported.status, 0, imported.stderr || imported.stdout)
+  const declarations = await readFile(path.join(installed, "dist/server.d.ts"), "utf8")
+  assert.doesNotMatch(declarations, /from ["']\.\//, "declarations reference an unpublished internal module")
+} finally {
+  await rm(isolatedRoot, { recursive: true, force: true })
+}
+process.stdout.write(`PASS: package contains ${files.size} files; both packed V2 exports load with no runtime dependencies.\n`)

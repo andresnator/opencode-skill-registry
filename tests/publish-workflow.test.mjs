@@ -22,8 +22,8 @@ function shouldUsePinnedToolingAndTheReleaseTag() {
     "pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86",
   ])
   for (const text of [
-    "ref: ${{ github.event.release.tag_name }}", "persist-credentials: false", "node-version: 22.23.2",
-    "version: 10.34.5", "npm install --global npm@12.0.2",
+    "ref: ${{ github.event.release.tag_name }}", "persist-credentials: false", "node-version: 24.20.0",
+    "version: 12.11.2", "npm install --global npm@12.0.2",
   ]) assert.ok(workflow.includes(text), `workflow is missing ${text}`)
 }
 

@@ -25,20 +25,20 @@ function tableCell(value: string) {
 function compareNames(left: OpenCodeSkill, right: OpenCodeSkill) {
   if (left.name < right.name) return -1
   if (left.name > right.name) return 1
-  return 0
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0
 }
 
 function renderSkillSection(heading: string, skills: OpenCodeSkill[]) {
   const rows = skills
     .sort(compareNames)
-    .map((skill) => `| ${tableCell(skill.description ?? "-")} | ${tableCell(skill.name)} | ${tableCell(skill.location)} |`)
+    .map((skill) => `| ${tableCell(skill.description ?? "-")} | ${tableCell(skill.id)} | ${tableCell(skill.name)} | ${tableCell(skill.location)} |`)
     .join("\n")
 
   return `## ${heading}
 
-| Description | Skill | Location |
-|---|---|---|
-${rows || "| - | - | - |"}`
+| Description | Skill ID | Name | Location |
+|---|---|---|---|
+${rows || "| - | - | - | - |"}`
 }
 
 export function renderRegistry(skills: OpenCodeSkill[], conventions: ConventionEntry[]) {
@@ -51,7 +51,7 @@ export function renderRegistry(skills: OpenCodeSkill[], conventions: ConventionE
 
   return `# Skill Registry
 
-Auto-generated — do not edit. Discovery index of the skills active in this OpenCode session. Match a description, then load the skill with OpenCode's \`skill\` tool; filesystem locations can also be read directly.
+Auto-generated — do not edit. Discovery index of the skills active in this OpenCode session. Match a description, then load the Skill ID with OpenCode's native skill loader; filesystem locations can also be read directly.
 
 ${skillSections}
 
