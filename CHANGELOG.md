@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/andresnator/opencode-skill-registry/compare/v0.2.1...v0.3.0) (2026-10-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **plugin:** migrate to OpenCode 2.0.28 ([#17](https://github.com/andresnator/opencode-skill-registry/issues/17))
+
+### Features
+
+* **plugin:** migrate to OpenCode 2.0.28 ([#17](https://github.com/andresnator/opencode-skill-registry/issues/17)) ([a6e55d0](https://github.com/andresnator/opencode-skill-registry/commit/a6e55d095e84e59e2d92b5b83e7b571890cc143b))
+
 ## [0.2.1](https://github.com/andresnator/opencode-skill-registry/compare/v0.2.0...v0.2.1) (2026-08-30)
 
 
