@@ -1,9 +1,10 @@
 import { statSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin"
 
 export type OpenCodeSkill = {
+  id: string
   name: string
   description?: string
   location: string
@@ -25,59 +26,38 @@ export const CONVENTION_FILE_NAMES = [
 ] as const
 
 type UnknownRecord = Record<string, unknown>
-type SkillRequest = (parameters?: { directory?: string }) => Promise<unknown>
-type LegacyGet = (options: { url: string }) => Promise<unknown>
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function resultData(result: unknown) {
-  if (!isRecord(result)) return result
-  if ("error" in result && result.error !== undefined && result.error !== null) {
-    const detail = result.error instanceof Error ? result.error.message : String(result.error)
-    throw new Error(`OpenCode /skill request failed: ${detail}`)
-  }
-  return "data" in result ? result.data : result
-}
-
 function normalizeSkills(value: unknown): OpenCodeSkill[] {
-  if (!Array.isArray(value)) throw new TypeError("OpenCode /skill returned a non-array response")
+  if (!Array.isArray(value)) throw new TypeError("OpenCode skill.list returned a non-array response")
 
-  const seenNames = new Set<string>()
+  const seenIDs = new Set<string>()
   return value.map((item, index) => {
-    if (!isRecord(item)) throw new TypeError(`OpenCode /skill returned an invalid entry at index ${index}`)
-    if (typeof item.name !== "string") throw new TypeError(`OpenCode /skill entry ${index} has no string name`)
-    if (typeof item.location !== "string") throw new TypeError(`OpenCode /skill entry ${index} has no string location`)
+    if (!isRecord(item)) throw new TypeError(`OpenCode skill.list returned an invalid entry at index ${index}`)
+    if (typeof item.id !== "string") throw new TypeError(`OpenCode skill.list entry ${index} has no string id`)
+    if (typeof item.name !== "string") throw new TypeError(`OpenCode skill.list entry ${index} has no string name`)
+    if (typeof item.path !== "string") throw new TypeError(`OpenCode skill.list entry ${index} has no string path`)
     if (item.description !== undefined && typeof item.description !== "string") {
-      throw new TypeError(`OpenCode /skill entry ${index} has an invalid description`)
+      throw new TypeError(`OpenCode skill.list entry ${index} has an invalid description`)
     }
-    if (seenNames.has(item.name)) throw new TypeError(`OpenCode /skill returned duplicate name: ${item.name}`)
-    seenNames.add(item.name)
+    if (seenIDs.has(item.id)) throw new TypeError(`OpenCode skill.list returned duplicate id: ${item.id}`)
+    seenIDs.add(item.id)
 
     return {
+      id: item.id,
       name: item.name,
       description: item.description,
-      location: item.location,
+      location: item.path,
     }
   })
 }
 
-export async function loadOpenCodeSkills(client: PluginInput["client"], directory: string): Promise<OpenCodeSkill[]> {
-  const app = (client as unknown as { app?: { skills?: SkillRequest } }).app
-  let result: unknown
-
-  if (typeof app?.skills === "function") {
-    result = await app.skills.call(app, { directory })
-  } else {
-    const legacy = (client as unknown as { _client?: { get?: LegacyGet } })._client
-    if (typeof legacy?.get !== "function") {
-      throw new Error("OpenCode client does not expose the /skill transport")
-    }
-    result = await legacy.get.call(legacy, { url: "/skill" })
-  }
-
-  return normalizeSkills(resultData(result))
+export async function loadOpenCodeSkills(context: Pick<Plugin.Context, "skill">, signal?: AbortSignal): Promise<OpenCodeSkill[]> {
+  const result = await context.skill.list(undefined, { signal })
+  return normalizeSkills(result.data)
 }
 
 function regularFileSync(file: string) {
@@ -103,7 +83,8 @@ function isGeneratedPath(worktree: string, resolved: string) {
   return relative === generatedDirectory || relative.startsWith(`${generatedDirectory}${path.sep}`)
 }
 
-export async function collectConventionEntries(worktree: string): Promise<ConventionEntry[]> {
+export async function collectConventionEntries(worktree: string, signal?: AbortSignal): Promise<ConventionEntry[]> {
+  signal?.throwIfAborted()
   const seenInodes = new Set<string>()
   const conventionFiles = CONVENTION_FILE_NAMES.map((file) => path.join(worktree, file)).filter((file) => {
     const inode = inodeKeySync(file)
@@ -116,16 +97,19 @@ export async function collectConventionEntries(worktree: string): Promise<Conven
   const seenPaths = new Set<string>()
 
   for (const file of conventionFiles) {
+    signal?.throwIfAborted()
     entries.push({ file: path.basename(file), path: file, notes: "Detected compatibility convention" })
     seenPaths.add(file)
 
     let text: string
     try {
-      text = await fs.readFile(file, "utf8")
+      text = await fs.readFile(file, { encoding: "utf8", signal })
     } catch {
+      signal?.throwIfAborted()
       continue
     }
 
+    signal?.throwIfAborted()
     for (const match of text.matchAll(/`([^`]+)`/g)) {
       const candidate = match[1]
       if (!candidate || candidate.includes("*") || candidate.includes("{")) continue

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { spawn, spawnSync } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
+import { OpenCode } from "@opencode/client"
 import { createServer } from "node:http"
 import { createServer as createPortServer } from "node:net"
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
@@ -27,6 +28,16 @@ const AGENT_SKILL_NAMES = ["project-agent", "ancestor-agent", "global-agent"]
 const CLAUDE_SKILL_NAMES = ["project-claude", "ancestor-claude", "global-claude"]
 const DUPLICATE_SKILL_NAME = "duplicate-source"
 const PRIVATE_SKILL_NAME = "private-worktree-skill"
+const PRIVATE_SKILL_BODY = "PRIVATE_SKILL_BODY_MUST_STAY_OUT_OF_REGISTRY"
+const PLUGIN_ID = "andresnator.skill-registry"
+const AUTH_USERNAME = "opencode"
+const EQUAL_DISPLAY_NAME = "shared-display-name"
+const CONTRIBUTOR_IDS = ["fixture.early-contributor", "fixture.late-contributor"]
+const LATE_SKILL_ID = "late-added-skill"
+const DOWNLOADED_CONTRIBUTOR_ID = "fixture.downloaded-contributor"
+const CONTRIBUTOR_PACKAGE_NAME = "skill-registry-downloaded-contributor-fixture"
+const CONTRIBUTOR_PACKAGE_VERSION = "1.0.0"
+const DOWNLOAD_DELAY_MS = 1_500
 
 async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
   // Given
@@ -55,7 +66,8 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
   let registry
   try {
     const tarball = await packPackage(packageDirectory)
-    registry = await startRegistry(tarball, requests)
+    const contributor = await packContributorFixture(temporaryRoot)
+    registry = await startRegistry(tarball, requests, contributor)
     const isolatedEnvironment = {
       ...process.env,
       CI: "true",
@@ -70,30 +82,32 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
       XDG_CACHE_HOME: cacheHome,
       XDG_CONFIG_HOME: configHome,
       XDG_DATA_HOME: dataHome,
+      XDG_STATE_HOME: path.join(temporaryRoot, "state"),
+      OPENCODE_CONFIG_DIR: path.join(configHome, "opencode"),
+      TMPDIR: path.join(temporaryRoot, "tmp"),
     }
-    delete isolatedEnvironment.OPENCODE_CONFIG
-    delete isolatedEnvironment.OPENCODE_CONFIG_CONTENT
+    for (const key of ["OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD", "OPENCODE_SERVER", "OPENCODE_SERVER_URL"]) delete isolatedEnvironment[key]
+    await mkdir(isolatedEnvironment.TMPDIR, { recursive: true })
 
     // When
     const opencodeBin = process.env.OPENCODE_BIN ?? DEFAULT_OPENCODE_BIN
     const result = await runProcess(opencodeBin, [
-      "plugin", packageSpec, "--global", "--pure", "--print-logs", "--log-level", "DEBUG",
+      "plugin", "add", packageSpec, "--print-logs", "--log-level", "debug",
     ], isolatedEnvironment)
 
     // Then
     const output = stripAnsi(`${result.stdout}\n${result.stderr}`)
     assert.equal(result.timedOut, false, `OpenCode installation timed out:\n${output}`)
     assert.equal(result.code, 0, `first OpenCode installation failed:\n${output}\nregistry requests: ${requests.join(", ")}`)
-    assert.match(output, /Detected server target/)
     assert.ok(requests.includes(`GET /${PACKAGE_NAME}`), "OpenCode did not request the package metadata")
     assert.ok(
       requests.includes(`GET /${PACKAGE_NAME}/-/${PACKAGE_NAME}-${packageJson.version}.tgz`),
       `OpenCode did not download the packed artifact: ${requests.join(", ")}`,
     )
 
-    const configFile = path.join(configHome, "opencode", "opencode.jsonc")
+    const configFile = path.join(configHome, "opencode", "opencode.json")
     const config = JSON.parse(await readFile(configFile, "utf8"))
-    assert.deepEqual(config.plugin, [packageSpec])
+    assert.deepEqual(config.plugins, [packageSpec])
 
     const version = await runProcess(opencodeBin, ["--version"], isolatedEnvironment)
     assert.equal(version.code, 0, version.stderr)
@@ -102,8 +116,11 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
       isolatedEnvironment,
       repositoryDirectory,
       sessionDirectory,
+      version.stdout.trim(),
     )
-    process.stdout.write(`PASS: clean-cache install and resolved-skill startup succeed on OpenCode ${version.stdout.trim()}.\n`)
+    assert.ok(requests.includes(`GET /${CONTRIBUTOR_PACKAGE_NAME}`), "OpenCode did not resolve the uncached contributor")
+    assert.ok(requests.includes(`GET /${CONTRIBUTOR_PACKAGE_NAME}/-/${CONTRIBUTOR_PACKAGE_NAME}-${CONTRIBUTOR_PACKAGE_VERSION}.tgz`), "OpenCode did not download the contributor")
+    process.stdout.write(`PASS: clean-cache install and first-prompt native-skill parity succeed on OpenCode ${version.stdout.trim()}.\n`)
   } finally {
     await registry?.close()
     await rm(temporaryRoot, { recursive: true, force: true })
@@ -184,15 +201,18 @@ async function writeSkillFixtures({ configHome, homeDirectory, repositoryDirecto
       DUPLICATE_SKILL_NAME,
       "Claude duplicate candidate.",
     ),
+    writeSkill(path.join(sessionDirectory, ".opencode/skills/equal-name-one"), EQUAL_DISPLAY_NAME, "First distinct ID."),
+    writeSkill(path.join(sessionDirectory, ".opencode/skills/equal-name-two"), EQUAL_DISPLAY_NAME, "Second distinct ID."),
     writeSkill(
       path.join(repositoryDirectory, "skills/private-worktree-skill"),
       PRIVATE_SKILL_NAME,
       "Private scanner exception must stay inactive.",
     ),
   ])
+  const contributors = await writeContributorFixtures(repositoryDirectory)
   await writeFile(
     path.join(repositoryDirectory, "opencode.json"),
-    `${JSON.stringify({ skills: { paths: ["./configured-skills"] } }, null, 2)}\n`,
+    `${JSON.stringify({ skills: ["./configured-skills"], plugins: [...contributors, `${CONTRIBUTOR_PACKAGE_NAME}@${CONTRIBUTOR_PACKAGE_VERSION}`] }, null, 2)}\n`,
     "utf8",
   )
 }
@@ -202,6 +222,7 @@ async function shouldMatchResolvedOpenCodeSkillsAcrossFlags(
   environment,
   repositoryDirectory,
   sessionDirectory,
+  version,
 ) {
   // Given
   const externalSkillsEnabled = {
@@ -217,6 +238,7 @@ async function shouldMatchResolvedOpenCodeSkillsAcrossFlags(
     externalSkillsEnabled,
     repositoryDirectory,
     sessionDirectory,
+    true,
   )
   const withoutClaude = await captureResolvedSnapshot(
     opencodeBin,
@@ -231,14 +253,25 @@ async function shouldMatchResolvedOpenCodeSkillsAcrossFlags(
     sessionDirectory,
   )
 
+  const configFile = path.join(repositoryDirectory, "opencode.json")
+  const config = JSON.parse(await readFile(configFile, "utf8"))
+  await writeFile(configFile, `${JSON.stringify({ ...config, plugins: [...config.plugins].reverse() })}\n`, "utf8")
+  const reordered = await captureResolvedSnapshot(opencodeBin, externalSkillsEnabled, repositoryDirectory, sessionDirectory)
+
   // Then
+  assert.deepEqual(reordered.skills.map(skillTriple).sort(compareSkillTriples), allSources.skills.map(skillTriple).sort(compareSkillTriples))
+  assertSkillsPresent(allSources, [...CONTRIBUTOR_IDS, DOWNLOADED_CONTRIBUTOR_ID])
   assertSkillsPresent(allSources, [...NATIVE_SKILL_NAMES, ...AGENT_SKILL_NAMES, ...CLAUDE_SKILL_NAMES])
   assertSkillsAbsent(allSources, [PRIVATE_SKILL_NAME])
-  assertSkillsPresent(withoutClaude, [...NATIVE_SKILL_NAMES, ...AGENT_SKILL_NAMES])
-  assertSkillsAbsent(withoutClaude, [...CLAUDE_SKILL_NAMES, PRIVATE_SKILL_NAME])
-  assertSkillsPresent(withoutExternal, NATIVE_SKILL_NAMES)
-  assertSkillsAbsent(withoutExternal, [...AGENT_SKILL_NAMES, ...CLAUDE_SKILL_NAMES, PRIVATE_SKILL_NAME])
-  for (const snapshot of [allSources, withoutClaude, withoutExternal]) {
+  // Characterize the installed release without imposing its ignored flags on future 2.x versions.
+  if (version.match(/\d+\.\d+\.\d+/)?.[0] === "2.0.28") {
+    for (const snapshot of [withoutClaude, withoutExternal]) {
+      assert.deepEqual(snapshot.skills.map(skillTriple).sort(compareSkillTriples), allSources.skills.map(skillTriple).sort(compareSkillTriples))
+    }
+  }
+  for (const snapshot of [allSources, withoutClaude, withoutExternal, reordered]) {
+    assert.equal(snapshot.skills.filter((entry) => entry.name === EQUAL_DISPLAY_NAME).length, 2)
+    assert.equal(snapshot.registryEntries.filter((entry) => entry.name === EQUAL_DISPLAY_NAME).length, 2)
     assert.equal(snapshot.skills.filter((entry) => entry.name === DUPLICATE_SKILL_NAME).length, 1)
     assert.equal(snapshot.registryEntries.filter((entry) => entry.name === DUPLICATE_SKILL_NAME).length, 1)
   }
@@ -247,41 +280,155 @@ async function shouldMatchResolvedOpenCodeSkillsAcrossFlags(
   for (const name of NATIVE_SKILL_NAMES) assertRegistrySection(allSources, name, "OpenCode Skills")
 }
 
-async function captureResolvedSnapshot(opencodeBin, environment, repositoryDirectory, sessionDirectory) {
+async function captureResolvedSnapshot(opencodeBin, environment, repositoryDirectory, sessionDirectory, verifyLifecycle = false) {
   const files = {
     registry: path.join(repositoryDirectory, ".ai/atl/skill-registry.md"),
     hash: path.join(repositoryDirectory, ".ai/atl/skill-registry.hash"),
   }
-  await Promise.all([rm(files.registry, { force: true }), rm(files.hash, { force: true })])
+  await mkdir(path.dirname(files.registry), { recursive: true })
+  await writeFile(files.registry, "# Legacy V1 registry\n", "utf8")
+  await writeFile(files.hash, "legacy-hash\n", "utf8")
   const port = await reservePort()
-  const serverExecutable = await resolveServerExecutable(opencodeBin)
-  const server = startProcess(serverExecutable, [
-    "serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs", "--log-level", "DEBUG",
-  ], environment, sessionDirectory)
+  const password = randomBytes(32).toString("hex")
+  const authorization = `Basic ${Buffer.from(`${AUTH_USERNAME}:${password}`).toString("base64")}`
+  const client = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`, headers: { Authorization: authorization } })
+  const location = { directory: sessionDirectory }
+  const server = startProcess(opencodeBin, [
+    "serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs", "--log-level", "debug",
+  ], { ...environment, OPENCODE_PASSWORD: password, OPENCODE_SERVER_PASSWORD: password }, sessionDirectory, [password, authorization, authorization.slice(6)])
 
   try {
     // When
-    await waitForBootstrap(port, sessionDirectory, server)
-    await waitForFile(files.registry, server)
-    const response = await fetch(`http://127.0.0.1:${port}/skill?directory=${encodeURIComponent(sessionDirectory)}`, {
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    })
-    assert.equal(response.ok, true, `OpenCode /skill failed: ${response.status}\n${server.output()}`)
-    const skills = await response.json()
+    await waitForBootstrap(client, location, server)
+    await waitForRegistryPlugin(client, location, server)
+    assert.equal(await readFile(files.registry, "utf8"), "# Legacy V1 registry\n", "setup must not publish before a prompt")
+    assert.equal(await readFile(files.hash, "utf8"), "legacy-hash\n")
+    await sendPromptWithoutInference(client, location)
+    const { data: skills } = await client.skill.list({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
     const markdown = await readFile(files.registry, "utf8")
+    const unauthenticated = await fetch(`http://127.0.0.1:${port}/api/skill?directory=${encodeURIComponent(sessionDirectory)}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    assert.equal(unauthenticated.status, 401, "the isolated server must keep authentication enabled")
 
     // Then
-    assert.ok(Array.isArray(skills), `OpenCode /skill did not return an array\n${server.output()}`)
+    assert.ok(Array.isArray(skills), `OpenCode skill.list did not return an array\n${server.output()}`)
+    assert.doesNotMatch(markdown, new RegExp(PRIVATE_SKILL_BODY))
+    assert.equal((await readFile(files.hash, "utf8")).trim(), createHash("sha256").update(markdown).digest("hex"))
     const registryEntries = skillEntriesFromRegistry(markdown)
     assert.deepEqual(
       registryEntries.map(skillTriple).sort(compareSkillTriples),
-      skills.map(skillTriple).sort(compareSkillTriples),
-      `generated registry differs from OpenCode /skill\n${server.output()}`,
+      skills.map((entry) => skillTriple({ ...entry, location: entry.path })).sort(compareSkillTriples),
+      `generated registry differs from OpenCode skill.list\n${server.output()}`,
     )
+    await assert.rejects(stat(path.join(sessionDirectory, ".ai/atl/skill-registry.md")), /ENOENT/)
+    if (verifyLifecycle) await shouldKeepSnapshotAndCleanUpWhenNativeLocationReloads(client, location, files, repositoryDirectory, server)
     return { markdown, registryEntries, skills }
   } finally {
     await server.stop()
   }
+}
+
+async function sendPromptWithoutInference(client, location) {
+  const session = await client.session.create({ location }, { signal: AbortSignal.timeout(RUNTIME_TIMEOUT_MS) })
+  await client.session.prompt({ sessionID: session.id, text: "Exercise the registry prompt hook.", resume: false }, {
+    signal: AbortSignal.timeout(RUNTIME_TIMEOUT_MS),
+  })
+}
+
+async function writeContributorFixtures(repositoryDirectory) {
+  const directories = []
+  for (const id of CONTRIBUTOR_IDS) {
+    const directory = path.join(repositoryDirectory, "contributors", id)
+    directories.push(directory)
+    await mkdir(directory, { recursive: true })
+    await writeFile(path.join(directory, "package.json"), JSON.stringify({ type: "module", main: "./index.mjs" }))
+    await writeFile(path.join(directory, "index.mjs"), `
+      import { appendFile } from "node:fs/promises"
+      export default {
+        id: ${JSON.stringify(id)},
+        async setup(ctx) {
+          await new Promise((resolve) => setTimeout(resolve, 150))
+          await ctx.skill.transform((editor) => editor.add({
+            id: ${JSON.stringify(id)},
+            name: ${JSON.stringify(id)},
+            description: "Delayed startup contributor.",
+            path: ${JSON.stringify(path.join(directory, "SKILL.md"))},
+            content: ${JSON.stringify(PRIVATE_SKILL_BODY)},
+          }))
+          return () => appendFile(${JSON.stringify(path.join(repositoryDirectory, "contributor-cleanup.log"))}, ${JSON.stringify(id + "\n")})
+        },
+      }
+    `)
+  }
+  return directories
+}
+
+async function shouldKeepSnapshotAndCleanUpWhenNativeLocationReloads(client, location, files, repositoryDirectory, server) {
+  // Given
+  const markdown = await readFile(files.registry, "utf8")
+  const hash = await readFile(files.hash, "utf8")
+  const previous = await stat(files.registry)
+  const lateDirectory = path.join(location.directory, ".opencode/skills", LATE_SKILL_ID)
+
+  try {
+    // When
+    await writeSkill(lateDirectory, LATE_SKILL_ID, "Native skills may change after the fixed first-prompt snapshot.")
+    await waitForCondition(async () => {
+      const { data } = await client.skill.list({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+      return data.some((entry) => entry.id === LATE_SKILL_ID)
+    }, "native skill watcher update", server)
+    await sendPromptWithoutInference(client, location)
+
+    // Then
+    assert.deepEqual({
+      markdown: await readFile(files.registry, "utf8"),
+      hash: await readFile(files.hash, "utf8"),
+      mtime: (await stat(files.registry)).mtimeMs,
+    }, { markdown, hash, mtime: previous.mtimeMs })
+  } finally {
+    await rm(lateDirectory, { recursive: true, force: true })
+  }
+
+  // When
+  await client.location.reload({ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+  await waitForCondition(async () => {
+    try {
+      const cleanup = await readFile(path.join(repositoryDirectory, "contributor-cleanup.log"), "utf8")
+      return CONTRIBUTOR_IDS.every((id) => cleanup.includes(id))
+    } catch {
+      return false
+    }
+  }, "native contributor cleanup", server)
+  await waitForBootstrap(client, location, server)
+  await waitForRegistryPlugin(client, location, server)
+
+  // Then
+  const { data } = await client.skill.list({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+  assert.equal(data.some((entry) => entry.id === LATE_SKILL_ID), false)
+  assert.deepEqual({
+    markdown: await readFile(files.registry, "utf8"),
+    hash: await readFile(files.hash, "utf8"),
+    mtime: (await stat(files.registry)).mtimeMs,
+  }, { markdown, hash, mtime: previous.mtimeMs }, "reload must defer generation until the next prompt")
+
+  // When
+  await writeFile(files.registry, "CORRUPTED AFTER RELOAD\n", "utf8")
+  await sendPromptWithoutInference(client, location)
+
+  // Then
+  assert.deepEqual({
+    markdown: await readFile(files.registry, "utf8"),
+    hash: await readFile(files.hash, "utf8"),
+  }, { markdown, hash }, "the first prompt after reload must repair the registry")
+}
+
+async function waitForCondition(condition, what, server) {
+  const deadline = Date.now() + RUNTIME_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    if (await condition()) return
+    if (server.closed()) throw new Error(`OpenCode server exited before ${what}\n${server.output()}`)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  throw new Error(`timed out waiting for ${what}\n${server.output()}`)
 }
 
 function initializeGitRepository(repositoryDirectory) {
@@ -289,21 +436,11 @@ function initializeGitRepository(repositoryDirectory) {
   assert.equal(result.status, 0, result.stderr || result.stdout)
 }
 
-async function resolveServerExecutable(opencodeBin) {
-  const executable = path.resolve(path.dirname(opencodeBin), "../opencode-ai/bin/opencode.exe")
-  try {
-    if ((await stat(executable)).isFile()) return executable
-  } catch {
-    // Non-standard OpenCode installations can expose an executable directly.
-  }
-  return opencodeBin
-}
-
 async function writeSkill(directory, name, description) {
   await mkdir(directory, { recursive: true })
   await writeFile(
     path.join(directory, "SKILL.md"),
-    `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\n`,
+    `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\n${PRIVATE_SKILL_BODY}\n`,
     "utf8",
   )
 }
@@ -313,30 +450,30 @@ function skillEntriesFromRegistry(markdown) {
   let section = ""
   for (const line of markdown.split("## Detected Convention Files")[0].split("\n")) {
     if (line.startsWith("## ")) section = line.slice(3)
-    if (!line.startsWith("| ") || line.startsWith("| Description ") || line === "| - | - | - |") continue
-    const [description, name, location] = line.slice(2, -2).split(" | ")
-    assert.ok(description !== undefined && name !== undefined && location !== undefined, `invalid registry row: ${line}`)
-    entries.push({ description: description === "-" ? undefined : description, location, name, section })
+    if (!line.startsWith("| ") || line.startsWith("| Description ") || line === "| - | - | - | - |") continue
+    const [description, id, name, location] = line.slice(2, -2).split(" | ")
+    assert.ok(description !== undefined && id !== undefined && name !== undefined && location !== undefined, `invalid registry row: ${line}`)
+    entries.push({ description: description === "-" ? undefined : description, id, location, name, section })
   }
   return entries
 }
 
 function skillTriple(entry) {
-  return { name: entry.name, description: entry.description, location: entry.location }
+  return { id: entry.id, name: entry.name, description: entry.description, location: entry.location ?? entry.path }
 }
 
 function compareSkillTriples(left, right) {
-  return left.name.localeCompare(right.name) || left.location.localeCompare(right.location)
+  return left.id.localeCompare(right.id)
 }
 
 function assertSkillsPresent(snapshot, names) {
   const actual = new Set(snapshot.skills.map((entry) => entry.name))
-  for (const name of names) assert.ok(actual.has(name), `OpenCode /skill is missing expected skill: ${name}`)
+  for (const name of names) assert.ok(actual.has(name), `OpenCode skill.list is missing expected skill: ${name}`)
 }
 
 function assertSkillsAbsent(snapshot, names) {
   const actual = new Set(snapshot.skills.map((entry) => entry.name))
-  for (const name of names) assert.equal(actual.has(name), false, `OpenCode /skill unexpectedly contains skill: ${name}`)
+  for (const name of names) assert.equal(actual.has(name), false, `OpenCode skill.list unexpectedly contains skill: ${name}`)
 }
 
 function assertRegistrySection(snapshot, name, section) {
@@ -356,7 +493,7 @@ async function reservePort() {
   return address.port
 }
 
-function startProcess(command, args, env, cwd) {
+function startProcess(command, args, env, cwd, secrets = []) {
   const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] })
   let stdout = ""
   let stderr = ""
@@ -376,7 +513,7 @@ function startProcess(command, args, env, cwd) {
 
   return {
     closed: () => closed,
-    output: () => stripAnsi(`${stdout}\n${stderr}`),
+    output: () => redactDiagnostics(stripAnsi(`${stdout}\n${stderr}`), secrets),
     stop: async () => {
       if (!closed) child.kill("SIGTERM")
       await Promise.race([completion, new Promise((resolve) => setTimeout(resolve, 2_000))])
@@ -388,36 +525,98 @@ function startProcess(command, args, env, cwd) {
   }
 }
 
-async function waitForFile(file, server) {
+async function waitForFile(file, server, hashFile) {
   const deadline = Date.now() + RUNTIME_TIMEOUT_MS
   while (Date.now() < deadline) {
     try {
-      await stat(file)
-      return
+      const text = await readFile(file, "utf8")
+      const hash = (await readFile(hashFile, "utf8")).trim()
+      if (text.startsWith("# Skill Registry") && hash === createHash("sha256").update(text).digest("hex")) return
     } catch {
-      const closed = server.closed()
-      if (closed) throw new Error(`OpenCode server exited before generating the registry: ${JSON.stringify(closed)}\n${server.output()}`)
-      await new Promise((resolve) => setTimeout(resolve, 50))
+      // Registry and hash may still be missing or between their two renames.
     }
+    const closed = server.closed()
+    if (closed) throw new Error(`OpenCode server exited before generating the registry: ${JSON.stringify(closed)}\n${server.output()}`)
+    await new Promise((resolve) => setTimeout(resolve, 50))
   }
   throw new Error(`timed out waiting for generated registry\n${server.output()}`)
 }
 
-async function waitForBootstrap(port, projectDirectory, server) {
-  const endpoint = `http://127.0.0.1:${port}/provider?directory=${encodeURIComponent(projectDirectory)}`
+async function waitForBootstrap(client, location, server) {
   const deadline = Date.now() + RUNTIME_TIMEOUT_MS
   while (Date.now() < deadline) {
     const closed = server.closed()
     if (closed) throw new Error(`OpenCode server exited before bootstrap: ${JSON.stringify(closed)}\n${server.output()}`)
     try {
-      const response = await fetch(endpoint, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
-      if (response.ok) return
+      await client.location.get({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+      return
     } catch {
       // The listener may not be ready yet.
     }
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
   throw new Error(`timed out waiting for OpenCode bootstrap\n${server.output()}`)
+}
+
+async function waitForRegistryPlugin(client, location, server) {
+  const deadline = Date.now() + RUNTIME_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    const { data: plugins } = await client.plugin.list({ location }, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    const plugin = plugins.find((entry) => entry.id === PLUGIN_ID)
+    const failed = plugins.find((entry) => entry.state.status === "failed")
+    assert.equal(failed, undefined, `plugin activation failed\n${server.output()}`)
+    if (plugin?.state.status === "active") return
+    if (server.closed()) throw new Error(`OpenCode server exited before plugin activation\n${server.output()}`)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  throw new Error(`timed out waiting for registry plugin activation\n${server.output()}`)
+}
+
+function redactDiagnostics(output, secrets) {
+  let safe = output.replace(/(password[:=]\s*)\S+/gi, "$1[redacted]")
+  for (const secret of secrets) if (secret) safe = safe.replaceAll(secret, "[redacted]")
+  return safe
+}
+
+function shouldRedactCredentialsWhenDiagnosticsAreReported() {
+  // Given
+  const fakePassword = "fixture-password-not-a-real-credential"
+  const fakeEncoded = Buffer.from(`${AUTH_USERNAME}:${fakePassword}`).toString("base64")
+
+  // When
+  const output = redactDiagnostics(`password: ${fakePassword}\nBasic ${fakeEncoded}`, [fakePassword, fakeEncoded])
+
+  // Then
+  assert.equal(output, "password: [redacted]\nBasic [redacted]")
+}
+
+async function shouldWaitForMatchingHashWhenRegistryIsPublishedFirst() {
+  // Given
+  const directory = await mkdtemp(path.join(tmpdir(), "skill-registry-readiness-"))
+  const registry = path.join(directory, "skill-registry.md")
+  const hash = path.join(directory, "skill-registry.hash")
+  const markdown = "# Skill Registry\n"
+  const matchingHash = createHash("sha256").update(markdown).digest("hex")
+  await writeFile(registry, markdown, "utf8")
+  await writeFile(hash, "previous-hash", "utf8")
+  const server = { closed: () => undefined, output: () => "" }
+  let ready = false
+  const pending = waitForFile(registry, server, hash).then(() => { ready = true })
+
+  try {
+    // When
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(ready, false, "a new registry with an old hash is not ready")
+    await writeFile(hash, matchingHash, "utf8")
+    await pending
+
+    // Then
+    assert.equal(ready, true)
+  } finally {
+    await writeFile(hash, matchingHash, "utf8")
+    await pending
+    await rm(directory, { recursive: true, force: true })
+  }
 }
 
 async function packPackage(destination) {
@@ -429,32 +628,67 @@ async function packPackage(destination) {
   return readFile(path.join(destination, `${PACKAGE_NAME}-${packageJson.version}.tgz`))
 }
 
-async function startRegistry(tarball, requests) {
+async function packContributorFixture(temporaryRoot) {
+  const directory = path.join(temporaryRoot, "contributor/package")
+  const manifest = {
+    name: CONTRIBUTOR_PACKAGE_NAME,
+    version: CONTRIBUTOR_PACKAGE_VERSION,
+    type: "module",
+    main: "./index.mjs",
+  }
+  await mkdir(directory, { recursive: true })
+  await writeFile(path.join(directory, "package.json"), JSON.stringify(manifest))
+  await writeFile(path.join(directory, "index.mjs"), `
+    export default {
+      id: ${JSON.stringify(DOWNLOADED_CONTRIBUTOR_ID)},
+      async setup(ctx) {
+        await ctx.skill.transform((editor) => editor.add({
+          id: ${JSON.stringify(DOWNLOADED_CONTRIBUTOR_ID)},
+          name: ${JSON.stringify(DOWNLOADED_CONTRIBUTOR_ID)},
+          description: "Contributor installed during the second activation pass.",
+          path: ${JSON.stringify(path.join(directory, "SKILL.md"))},
+          content: ${JSON.stringify(PRIVATE_SKILL_BODY)},
+        }))
+      },
+    }
+  `)
+  const archive = path.join(temporaryRoot, "contributor.tgz")
+  const result = spawnSync("tar", ["-czf", archive, "-C", path.dirname(directory), "package"], { encoding: "utf8" })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  return { manifest, tarball: await readFile(archive) }
+}
+
+async function startRegistry(tarball, requests, contributor) {
+  const packages = [{ manifest: packageJson, tarball }, contributor]
   const server = createServer((request, response) => {
     requests.push(`${request.method} ${request.url}`)
-    if (request.method === "GET" && request.url === `/${PACKAGE_NAME}`) {
-      const address = server.address()
-      assert.ok(address && typeof address === "object")
-      const tarballUrl = `http://127.0.0.1:${address.port}/${PACKAGE_NAME}/-/${PACKAGE_NAME}-${packageJson.version}.tgz`
-      return sendJson(response, {
-        name: PACKAGE_NAME,
-        "dist-tags": { latest: packageJson.version },
-        versions: {
-          [packageJson.version]: {
-            ...packageJson,
-            dist: {
-              integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
-              shasum: createHash("sha1").update(tarball).digest("hex"),
-              tarball: tarballUrl,
+    for (const { manifest, tarball } of packages) {
+      const { name, version } = manifest
+      const tarballPath = `/${name}/-/${name}-${version}.tgz`
+      if (request.method === "GET" && request.url === `/${name}`) {
+        const address = server.address()
+        assert.ok(address && typeof address === "object")
+        const metadata = {
+          name,
+          "dist-tags": { latest: version },
+          versions: {
+            [version]: {
+              ...manifest,
+              dist: {
+                integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+                shasum: createHash("sha1").update(tarball).digest("hex"),
+                tarball: `http://127.0.0.1:${address.port}${tarballPath}`,
+              },
             },
           },
-        },
-      })
-    }
-
-    if (request.method === "GET" && request.url === `/${PACKAGE_NAME}/-/${PACKAGE_NAME}-${packageJson.version}.tgz`) {
-      response.writeHead(200, { "content-length": tarball.length, "content-type": "application/octet-stream" })
-      return response.end(tarball)
+        }
+        if (name === CONTRIBUTOR_PACKAGE_NAME) return setTimeout(() => sendJson(response, metadata), DOWNLOAD_DELAY_MS)
+        return sendJson(response, metadata)
+      }
+      if (request.method === "GET" && request.url === tarballPath) {
+        response.writeHead(200, { "content-length": tarball.length, "content-type": "application/octet-stream" })
+        return response.end(tarball)
+      }
     }
 
     if (request.method === "POST" && request.url?.startsWith("/-/npm/v1/security/")) return sendJson(response, {})
@@ -507,4 +741,6 @@ function stripAnsi(value) {
   return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
 }
 
+shouldRedactCredentialsWhenDiagnosticsAreReported()
+await shouldWaitForMatchingHashWhenRegistryIsPublishedFirst()
 await shouldInstallOnFirstAttemptWhenCacheIsEmpty()

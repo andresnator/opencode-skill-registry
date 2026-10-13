@@ -6,7 +6,7 @@ const ROOT = new URL("../", import.meta.url)
 const PACKAGE_NAME = "opencode-skill-registry"
 const NPM_REGISTRY = "https://registry.npmjs.org/"
 const NODE_RANGE = ">=22.0.0"
-const OPENCODE_RANGE = ">=1.17.15 <2"
+const OPENCODE_RANGE = ">=2.0.28 <3"
 const NPM_LIFECYCLE_SCRIPTS = [
   "dependencies", "install", "postinstall", "postpack", "postprepare", "postpublish", "postversion",
   "preinstall", "prepack", "prepare", "preprepare", "prepublish", "prepublishOnly", "preversion", "publish", "version",

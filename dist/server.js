@@ -1,5 +1,11 @@
 // src/server.ts
 import path3 from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+
+// src/constants.ts
+var MAX_RETRIES = 3;
+var RETRY_COOLDOWN_MS = 1e3;
+var STARTUP_TIMEOUT_MS = 5e3;
 
 // src/registry.ts
 var SOURCE_SECTIONS = [
@@ -21,15 +27,15 @@ function tableCell(value) {
 function compareNames(left, right) {
   if (left.name < right.name) return -1;
   if (left.name > right.name) return 1;
-  return 0;
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
 }
 function renderSkillSection(heading, skills) {
-  const rows = skills.sort(compareNames).map((skill) => `| ${tableCell(skill.description ?? "-")} | ${tableCell(skill.name)} | ${tableCell(skill.location)} |`).join("\n");
+  const rows = skills.sort(compareNames).map((skill) => `| ${tableCell(skill.description ?? "-")} | ${tableCell(skill.id)} | ${tableCell(skill.name)} | ${tableCell(skill.location)} |`).join("\n");
   return `## ${heading}
 
-| Description | Skill | Location |
-|---|---|---|
-${rows || "| - | - | - |"}`;
+| Description | Skill ID | Name | Location |
+|---|---|---|---|
+${rows || "| - | - | - | - |"}`;
 }
 function renderRegistry(skills, conventions) {
   const skillSections = SOURCE_SECTIONS.map(
@@ -38,7 +44,7 @@ function renderRegistry(skills, conventions) {
   const conventionRows = conventions.map((entry) => `| ${tableCell(entry.file)} | ${tableCell(entry.path)} | ${tableCell(entry.notes)} |`).join("\n");
   return `# Skill Registry
 
-Auto-generated \u2014 do not edit. Discovery index of the skills active in this OpenCode session. Match a description, then load the skill with OpenCode's \`skill\` tool; filesystem locations can also be read directly.
+Auto-generated \u2014 do not edit. Discovery index of the skills active in this OpenCode session. Match a description, then load the Skill ID with OpenCode's native skill loader; filesystem locations can also be read directly.
 
 ${skillSections}
 
@@ -67,46 +73,30 @@ var CONVENTION_FILE_NAMES = [
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function resultData(result) {
-  if (!isRecord(result)) return result;
-  if ("error" in result && result.error !== void 0 && result.error !== null) {
-    const detail = result.error instanceof Error ? result.error.message : String(result.error);
-    throw new Error(`OpenCode /skill request failed: ${detail}`);
-  }
-  return "data" in result ? result.data : result;
-}
 function normalizeSkills(value) {
-  if (!Array.isArray(value)) throw new TypeError("OpenCode /skill returned a non-array response");
-  const seenNames = /* @__PURE__ */ new Set();
+  if (!Array.isArray(value)) throw new TypeError("OpenCode skill.list returned a non-array response");
+  const seenIDs = /* @__PURE__ */ new Set();
   return value.map((item, index) => {
-    if (!isRecord(item)) throw new TypeError(`OpenCode /skill returned an invalid entry at index ${index}`);
-    if (typeof item.name !== "string") throw new TypeError(`OpenCode /skill entry ${index} has no string name`);
-    if (typeof item.location !== "string") throw new TypeError(`OpenCode /skill entry ${index} has no string location`);
+    if (!isRecord(item)) throw new TypeError(`OpenCode skill.list returned an invalid entry at index ${index}`);
+    if (typeof item.id !== "string") throw new TypeError(`OpenCode skill.list entry ${index} has no string id`);
+    if (typeof item.name !== "string") throw new TypeError(`OpenCode skill.list entry ${index} has no string name`);
+    if (typeof item.path !== "string") throw new TypeError(`OpenCode skill.list entry ${index} has no string path`);
     if (item.description !== void 0 && typeof item.description !== "string") {
-      throw new TypeError(`OpenCode /skill entry ${index} has an invalid description`);
+      throw new TypeError(`OpenCode skill.list entry ${index} has an invalid description`);
     }
-    if (seenNames.has(item.name)) throw new TypeError(`OpenCode /skill returned duplicate name: ${item.name}`);
-    seenNames.add(item.name);
+    if (seenIDs.has(item.id)) throw new TypeError(`OpenCode skill.list returned duplicate id: ${item.id}`);
+    seenIDs.add(item.id);
     return {
+      id: item.id,
       name: item.name,
       description: item.description,
-      location: item.location
+      location: item.path
     };
   });
 }
-async function loadOpenCodeSkills(client, directory) {
-  const app = client.app;
-  let result;
-  if (typeof app?.skills === "function") {
-    result = await app.skills.call(app, { directory });
-  } else {
-    const legacy = client._client;
-    if (typeof legacy?.get !== "function") {
-      throw new Error("OpenCode client does not expose the /skill transport");
-    }
-    result = await legacy.get.call(legacy, { url: "/skill" });
-  }
-  return normalizeSkills(resultData(result));
+async function loadOpenCodeSkills(context, signal) {
+  const result = await context.skill.list(void 0, { signal });
+  return normalizeSkills(result.data);
 }
 function regularFileSync(file) {
   try {
@@ -128,7 +118,8 @@ function isGeneratedPath(worktree, resolved) {
   const generatedDirectory = path.join(".ai", "atl");
   return relative === generatedDirectory || relative.startsWith(`${generatedDirectory}${path.sep}`);
 }
-async function collectConventionEntries(worktree) {
+async function collectConventionEntries(worktree, signal) {
+  signal?.throwIfAborted();
   const seenInodes = /* @__PURE__ */ new Set();
   const conventionFiles = CONVENTION_FILE_NAMES.map((file) => path.join(worktree, file)).filter((file) => {
     const inode = inodeKeySync(file);
@@ -139,14 +130,17 @@ async function collectConventionEntries(worktree) {
   const entries = [];
   const seenPaths = /* @__PURE__ */ new Set();
   for (const file of conventionFiles) {
+    signal?.throwIfAborted();
     entries.push({ file: path.basename(file), path: file, notes: "Detected compatibility convention" });
     seenPaths.add(file);
     let text;
     try {
-      text = await fs.readFile(file, "utf8");
+      text = await fs.readFile(file, { encoding: "utf8", signal });
     } catch {
+      signal?.throwIfAborted();
       continue;
     }
+    signal?.throwIfAborted();
     for (const match of text.matchAll(/`([^`]+)`/g)) {
       const candidate = match[1];
       if (!candidate || candidate.includes("*") || candidate.includes("{")) continue;
@@ -212,65 +206,81 @@ async function publishRegistry(worktree, markdown, renameFile = fs2.rename) {
 
 // src/server.ts
 var SKILL_REGISTRY_PLUGIN_ID = "andresnator.skill-registry";
-var MAX_RETRIES = 3;
-var RETRY_COOLDOWN_MS = 1e3;
-function projectRoot(input) {
-  const reportedWorktree = input.worktree ?? "";
-  if (!reportedWorktree || reportedWorktree === path3.parse(reportedWorktree).root) return input.directory;
+function projectRoot(location) {
+  const reportedWorktree = location.project.directory;
+  if (!reportedWorktree || reportedWorktree === path3.parse(reportedWorktree).root) return location.directory;
   return reportedWorktree;
 }
-async function generateRegistry(input, worktree) {
-  const [skills, conventions] = await Promise.all([
-    loadOpenCodeSkills(input.client, input.directory),
-    collectConventionEntries(worktree)
-  ]);
-  await publishRegistry(worktree, renderRegistry(skills, conventions));
-}
-var SkillRegistryPlugin = async (input) => {
-  const root = projectRoot(input);
-  let started = false;
-  let failed = false;
-  let running = false;
-  let retries = 0;
-  let nextRetryAt = 0;
-  const run = async () => {
-    running = true;
+var SkillRegistryPlugin = async (context) => {
+  const root = projectRoot(context.location);
+  const lifetime = new AbortController();
+  let task;
+  const registration = await context.session.hook("prompt", async () => {
+    if (lifetime.signal.aborted) return;
+    task ??= generateSnapshot(context, root, lifetime.signal);
+    await task;
+  });
+  return async () => {
+    lifetime.abort();
     try {
-      await generateRegistry(input, root);
-      failed = false;
-      retries = 0;
-    } catch (error) {
-      failed = true;
-      nextRetryAt = Date.now() + RETRY_COOLDOWN_MS;
-      const detail = error instanceof Error ? error.message : String(error);
-      if (retries >= MAX_RETRIES) {
-        console.error(`[skill-registry] ${detail} \u2014 retry budget spent, giving up until the next session`);
-      } else {
-        console.error(`[skill-registry] ${detail}`);
-      }
+      await registration.dispose();
     } finally {
-      running = false;
-    }
-  };
-  return {
-    config: async () => {
-      if (started) return;
-      started = true;
-      void run();
-    },
-    event: async () => {
-      if (!failed || running) return;
-      if (retries >= MAX_RETRIES) return;
-      if (retries > 0 && Date.now() < nextRetryAt) return;
-      retries += 1;
-      failed = false;
-      void run();
+      await task;
     }
   };
 };
+async function generateSnapshot(context, root, lifetime) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (lifetime.aborted) return;
+    try {
+      const markdown = await prepareSnapshot(context, root, lifetime);
+      lifetime.throwIfAborted();
+      await publishRegistry(root, markdown);
+      return;
+    } catch (error) {
+      if (lifetime.aborted) return;
+      const detail = error instanceof Error ? error.message : String(error);
+      const exhausted = attempt === MAX_RETRIES;
+      console.error(`[skill-registry] ${detail}${exhausted ? " \u2014 retry budget spent, giving up until reload or restart" : ""}`);
+      if (exhausted) return;
+      try {
+        await delay(RETRY_COOLDOWN_MS, void 0, { signal: lifetime });
+      } catch {
+        return;
+      }
+    }
+  }
+}
+async function prepareSnapshot(context, root, lifetime) {
+  const timeout = new AbortController();
+  const signal = AbortSignal.any([lifetime, timeout.signal]);
+  const timer = setTimeout(() => timeout.abort(new Error("OpenCode skill snapshot timed out")), STARTUP_TIMEOUT_MS);
+  try {
+    return await abortable(renderSnapshot(context, root, signal), signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function abortable(work, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
+}
+async function renderSnapshot(context, root, signal) {
+  signal.throwIfAborted();
+  const [skills, conventions] = await Promise.all([
+    loadOpenCodeSkills(context, signal),
+    collectConventionEntries(root, signal)
+  ]);
+  signal.throwIfAborted();
+  return renderRegistry(skills, conventions);
+}
 var server_default = {
   id: SKILL_REGISTRY_PLUGIN_ID,
-  server: SkillRegistryPlugin
+  setup: SkillRegistryPlugin
 };
 export {
   SKILL_REGISTRY_PLUGIN_ID,
