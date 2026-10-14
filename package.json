@@ -44,8 +44,8 @@
     "@opencode/client": "2.0.28",
     "@opencode/plugin": "2.0.28",
     "@types/node": "24.13.3",
-    "esbuild": "0.28.1",
-    "tsx": "4.23.5",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
     "typescript": "5.9.3"
   },
   "publishConfig": {
